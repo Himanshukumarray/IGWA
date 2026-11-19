@@ -26,7 +26,16 @@ Rules:
 3. Preserve tables using Markdown table syntax.
 4. Preserve numbers, dates, names and identifiers exactly.
 5. Do not invent missing text; mark unreadable text as [UNREADABLE].
-6. Return only the extracted text, with no commentary."""
+6. Return only the extracted text, with no commentary.
+
+SCRIPT RULES (the document mixes Hindi in Devanagari and English):
+- Transcribe every word in the script it is written in. Hindi stays in Devanagari; English stays in English.
+- NEVER translate between languages and NEVER transliterate (do not write Hindi in Roman letters or
+  English in Devanagari).
+- Do not interpret, summarize, normalize, expand abbreviations or add words that are not on the page.
+- Copy digits exactly as printed or written, including Devanagari digits (०-९) versus Western digits
+  (0-9); never convert one numeral system into the other.
+- Keep the original line breaks where practical, and keep names, numbers and legal sections exactly."""
 
 _PDF_RENDER_ZOOM = 2.0
 _MAX_CONCURRENT_PAGES = 1

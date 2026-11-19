@@ -1,3 +1,4 @@
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -17,6 +18,8 @@ class OCRData(BaseModel):
     full_text: str = ""
 
 class MetadataStatus(str, Enum):
+    PENDING = "pending"  # background task scheduled
+    PROCESSING = "processing"  # background extraction running
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
@@ -50,9 +53,13 @@ class OCRUploadResponse(BaseModel):
     success: bool = True
     message: str = "OCR processing completed successfully"
     document_id: str
+    job_id: str = Field(..., description="Same value as document_id; use it to poll metadata")
     status: OCRStatus
     filename: str
     ocr_model: str = Field(..., description="Model that produced the OCR text")
+    ocr_provider: str | None = Field(
+        default=None, description="gemini or groq"
+    )
     ocr_data: OCRData | None = None
     metadata: OCRMetadata | None = None
     metadata_model: str | None = Field(
@@ -64,13 +71,17 @@ class OCRUploadResponse(BaseModel):
     )
 
 class OCRResultResponse(BaseModel):
-    """Stored OCR result as returned by GET /ocr/{document_id}."""
+    """Stored OCR result as returned by GET /python/ocr/{document_id}."""
 
     success: bool = True
     document_id: str
+    job_id: str = ""
     status: OCRStatus
     filename: str
     ocr_model: str = Field(..., description="Model that produced the OCR text")
+    ocr_provider: str | None = Field(
+        default=None, description="gemini or groq"
+    )
     ocr_data: OCRData | None = None
     metadata: OCRMetadata | None = None
     metadata_model: str | None = Field(
@@ -80,19 +91,61 @@ class OCRResultResponse(BaseModel):
     metadata_error: str | None = Field(
         default=None, description="Set when metadata extraction failed or was skipped"
     )
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+class MetadataStatusResponse(BaseModel):
+    """GET /python/ocr/{job_id}/metadata: same shape in every state."""
+
+    job_id: str
+    metadata_status: MetadataStatus
+    metadata: OCRMetadata | None = None
+    metadata_provider: str | None = Field(
+        default=None, description="Model that produced the metadata"
+    )
+    metadata_error: str | None = None
 
 class ErrorResponse(BaseModel):
     detail: str
 
+class _ProviderPage(BaseModel):
+    page_number: int = Field(..., ge=1)
+    text: str = ""
+
 class GeminiOCRResult(BaseModel):
     """Schema Gemini is asked to follow (kept minimal for stability)."""
 
-    pages: list[OCRPage]
+    pages: list[_ProviderPage]
     full_text: str | None = None
+    # Filled by Gemini in the same request as the OCR text (single call, no second pass).
+    metadata: OCRMetadata | None = None
 
 def ocr_data_from_dict(raw: dict[str, Any]) -> OCRData:
     """Validate a parsed Gemini dict and build the OCR data stored/returned by the API."""
-    result = GeminiOCRResult.model_validate(raw)
-    pages = sorted(result.pages, key=lambda p: p.page_number)
+    # Metadata is validated separately (metadata_from_dict): malformed metadata must never
+    # discard otherwise good OCR text.
+    result = GeminiOCRResult.model_validate({k: v for k, v in raw.items() if k != "metadata"})
+    pages = [
+        OCRPage(page_number=p.page_number, text=p.text)
+        for p in sorted(result.pages, key=lambda p: p.page_number)
+    ]
     full_text = result.full_text or "\n\n".join(p.text for p in pages)
     return OCRData(pages=pages, full_text=full_text)
+
+
+def metadata_from_dict(raw: dict[str, Any]) -> OCRMetadata | None:
+    """Validated metadata from a combined OCR response, or None if absent/invalid/empty.
+
+    None means "extract it separately": malformed or all-empty metadata is never accepted.
+    """
+    candidate = raw.get("metadata")
+    if not isinstance(candidate, dict):
+        return None
+    try:
+        metadata = OCRMetadata.model_validate(candidate)
+    except ValueError:
+        return None
+    has_content = any(
+        (v if isinstance(v, str) else bool(v)) for v in metadata.model_dump().values() if v is not None
+    )
+    return metadata if has_content else None
