@@ -86,7 +86,7 @@ def attach_application(metadata: OCRMetadata, pages: list[OCRPage], job_id: str)
     location = metadata.application_location
     if location is None:
         logger.warning("job=%s Application location missing from model output: application not determined", job_id)
-        return metadata
+        return metadata.model_copy(update={"application": None})  # never trust model-written text
     started = time.perf_counter()
     try:
         application = extract_application(pages, location)

@@ -188,3 +188,11 @@ nothing is regenerated and no extra model call is made.
   returned rather than risk returning FIR text.
 - `application=null` (or `metadata=null` while pending/failed): unavailable, e.g. the model returned no/invalid
   location. This is never reported as "no application".
+
+### Case-management metadata fields
+
+`metadata` also carries `fir_date`, `incident_date` (both `YYYY-MM-DD` or `null`), `title`, `case_type`
+(`CaseType` enum), `case_status` (`CASE_STATUS` enum) and `fir_document`. Unsupported enum values or unclear dates
+are normalized to `null` instead of failing the metadata. `fir_document` is set by the server to the upload's
+`document_id` only when `isFir` is true (never taken from model output). Existing `accused_names` and
+`incident_date_time` remain the accused-persons and verbatim incident date/time fields.

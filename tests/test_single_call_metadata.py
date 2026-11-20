@@ -106,7 +106,7 @@ def test_hindi_metadata_values_are_kept_verbatim(setup):
     resp, _ = upload()
     assert resp.metadata.accused_names == [HINDI_NAME]
     assert resp.metadata.police_station == "खैरा थाना" and resp.metadata.incident_location == "धर्मपुर"
-    assert len(resp.metadata.model_dump()) == 16  # the 15 fields + metadata.application
+    assert len(resp.metadata.model_dump()) == 22  # 15 fields + application + 6 case-management fields
 
 
 def test_invalid_metadata_falls_back_to_background_extraction(setup):
@@ -149,6 +149,8 @@ def test_groq_ocr_has_no_same_call_metadata_so_background_runs(setup, monkeypatc
 def test_request_schema_and_prompt_cover_all_fifteen_fields():
     assert "metadata" in GeminiOCRResult.model_fields
     for field in OCRMetadata.model_fields:
+        if field == "fir_document":  # set by Python from the document id, never requested from the model
+            continue
         assert field in gemini_client.COMBINED_PROMPT
     assert "NEVER translate" in gemini_client.COMBINED_PROMPT and "STRICT RULES" in gemini_client.COMBINED_PROMPT
     assert gemini_client.COMBINED_PROMPT.startswith(gemini_client.OCR_PROMPT)

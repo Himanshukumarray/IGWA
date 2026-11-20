@@ -126,11 +126,11 @@ def test_confirmed_non_fir_is_not_logged_as_a_failure(env, caplog):
     assert "classified as non-FIR (APPLICATION)" in caplog.text and "unresolved" not in caplog.text
 
 
-def test_public_metadata_is_the_15_fields_plus_application(env):
+def test_public_metadata_fields_and_no_internal_keys(env):
     env(combined={"pages": PAGES, "metadata": meta("FIR")})
     resp, _ = upload()
     dumped = resp.metadata.model_dump()
-    assert len(dumped) == 16 and "application" in dumped and "application_location" not in dumped and "document_class" not in dumped and "isFir" not in dumped
+    assert len(dumped) == 22 and "application" in dumped and "application_location" not in dumped and "document_class" not in dumped and "isFir" not in dumped
 
 
 def test_request_schema_and_prompt_carry_the_classification_rules():

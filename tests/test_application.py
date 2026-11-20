@@ -332,3 +332,108 @@ def test_timing_logs_are_emitted_without_application_text(env, caplog):
     assert "Application extraction: found=True pages=4-5" in caplog.text
     assert "OCR timing" in caplog.text and "OCR API total response time" in caplog.text
     assert "SECRET-APPLICATION-BODY" not in caplog.text
+
+
+def test_investigation_actions_findings_rules_are_in_every_prompt_and_the_schema():
+    for prompt in (gemini_client.COMBINED_PROMPT, gemini_client.METADATA_PROMPT):
+        for needle in ("INCLUDE:", "EXCLUDE:", "One list item per distinct action", "never translated",
+                       "return []"):
+            assert needle in prompt, needle
+    desc = OCRMetadata.model_json_schema()["properties"]["investigation_actions_findings"]["description"]
+    assert "Not allegations" in desc
+
+
+# ---- case-management fields (fir_date, incident_date, title, case_type, case_status, fir_document) -----------------
+
+from services.ocr.schemas import CASE_STATUS, CaseType, normalize_iso_date  # noqa: E402
+
+CASE = {"fir_date": "2026-11-18", "incident_date": "2026-11-17", "title": "Cyber Fraud Complaint",
+        "case_type": "CYBER_CRIME", "case_status": None, "legal_sections": ["BNS 318(4)", "IT Act 66D"],
+        "accused_names": ["राम कुमार", "Unknown Person"], "complainant_name": "श्याम"}
+
+
+def test_enums_have_exactly_the_specified_values():
+    assert [s.value for s in CASE_STATUS] == ["ASSIGNED", "UNDER_INVESTIGATION", "CHARGE_SHEET_FILED", "CLOSED"]
+    assert len(CaseType) == 25 and CaseType.OTHER.value == "OTHER" and CaseType.WAGE_AND_HOUR.value == "WAGE_AND_HOUR"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-11-18", "2026-11-18"), ("2026-11-18T10:30", "2026-11-18"), ("18/11/2026", "2026-11-18"),
+    ("२५-११-२०२६", "2026-11-25"), ("05/03/2026", None),  # day/month order unclear: never guessed
+    ("2026-02-30", None), ("not a date", None), (None, None), (20260101, None),
+])
+def test_date_normalization_is_safe(raw, expected):
+    assert normalize_iso_date(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("CYBER_CRIME", CaseType.CYBER_CRIME), ("cyber crime", CaseType.CYBER_CRIME), ("Other", CaseType.OTHER),
+    ("MURDER", None), ("", None), (5, None), (None, None),
+])
+def test_invalid_case_type_is_normalized_to_null_without_failing_metadata(raw, expected):
+    md = OCRMetadata.model_validate({"fir_number": "1", "case_type": raw})
+    assert md.case_type == expected and md.fir_number == "1"
+
+
+def test_invalid_case_status_is_null_and_valid_one_is_kept():
+    assert OCRMetadata.model_validate({"case_status": "PENDING"}).case_status is None
+    assert OCRMetadata.model_validate({"case_status": "under_investigation"}).case_status is CASE_STATUS.UNDER_INVESTIGATION
+
+
+def test_old_style_metadata_without_new_fields_still_validates():
+    md = OCRMetadata.model_validate({"fir_number": "1", "accused_names": ["A"]})
+    assert md.case_type is None and md.case_status is None and md.fir_date is None and md.title is None
+
+
+def test_schema_has_enum_constraints_and_hides_python_owned_fields():
+    schema = OCRMetadata.model_json_schema()
+    props = schema["properties"]
+    assert "fir_document" not in props and "application" not in props
+    assert {"fir_date", "incident_date", "title", "case_type", "case_status"} <= set(props)
+    assert len(schema["$defs"]["CaseType"]["enum"]) == 25 and len(schema["$defs"]["CASE_STATUS"]["enum"]) == 4
+
+
+def test_prompt_defines_case_rules_for_both_providers():
+    p = gemini_client.COMBINED_PROMPT
+    for needle in ("CASE FIELDS", "Do not default to CRIMINAL", "CHARGE_SHEET_FILED", "routine registration wording",
+                   "YYYY-MM-DD", "never guess"):
+        assert needle in p, needle
+    assert "case_type" in gemini_client.METADATA_PROMPT
+    import inspect
+    assert "case_status" in inspect.getsource(groq_client)
+
+
+def test_api_returns_case_fields_and_fir_document_is_the_upload_id(env):
+    env(combined={"pages": PAGES5, "metadata": {**meta("FIR"), **CASE, "fir_document": "FORGED-BY-MODEL"},
+                  "application_location": {"found": False}})
+    resp = upload()
+    md = resp.metadata
+    assert md.case_type is CaseType.CYBER_CRIME and md.case_status is None and md.fir_date == "2026-11-18"
+    assert md.fir_document == resp.document_id  # model-supplied value discarded
+    body = json.loads(resp.model_dump_json())["metadata"]
+    assert body["case_type"] == "CYBER_CRIME" and body["case_status"] is None and body["accused_names"][0] == "राम कुमार"
+    assert body["fir_number"] == "0112/2025" and body["legal_sections"] == ["BNS 318(4)", "IT Act 66D"]
+    assert "document_narrative" in body and "investigation_actions_findings" in body  # existing fields kept
+
+
+def test_non_fir_has_no_fir_document(env):
+    env(combined={"pages": PAGES5, "metadata": {**meta("APPLICATION"), "fir_document": "FORGED"},
+                  "application_location": {"found": False}})
+    assert upload().metadata.fir_document is None
+
+
+def test_model_sent_invalid_enums_do_not_break_the_response(env):
+    env(combined={"pages": PAGES5, "metadata": {**meta("FIR"), "case_type": "MURDER", "case_status": "OPEN",
+                                                 "fir_date": "yesterday"},
+                  "application_location": {"found": False}})
+    resp = upload()
+    assert resp.metadata_status == MetadataStatus.COMPLETED and resp.metadata.fir_number == "0112/2025"
+    assert (resp.metadata.case_type, resp.metadata.case_status, resp.metadata.fir_date) == (None, None, None)
+
+
+def test_groq_fallback_returns_the_same_case_fields_and_fir_document(env):
+    env(combined=RuntimeError("down"), groq_meta={**meta("FIR"), **CASE})
+    resp = upload()
+    status = service.get_metadata_status(resp.job_id)
+    assert status.metadata.case_type is CaseType.CYBER_CRIME and status.metadata.incident_date == "2026-11-17"
+    assert status.metadata.fir_document == resp.job_id and status.isFir is True

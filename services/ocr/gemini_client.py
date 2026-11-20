@@ -177,6 +177,23 @@ or an empty array as appropriate.
 document_narrative must be taken from the actual wording of the document
 (the complaint/statement/report text), not a new summary. If ambiguous, use null.
 
+investigation_actions_findings: a list of the steps the police/investigating authority actually took
+and the findings they themselves recorded, as stated in the document. Rules:
+- INCLUDE: actions such as registering the case and taking up the investigation, visiting or inspecting the
+  scene, recording statements, seizing or recovering items, sending items for examination, medical
+  examination, arrest, search, notices issued, sections added or removed, forwarding or transferring the
+  case; and findings such as an investigator's recorded conclusion or the result of an examination.
+- EXCLUDE: the complainant's or witnesses' allegations and the story of the incident (that belongs in
+  document_narrative), what the accused is alleged to have done, the list of legal sections itself, plain
+  header/registration data (numbers, dates, police station), and anything only requested or hoped for in an
+  application (e.g. "please register a case" is a request, not an action taken).
+- One list item per distinct action or finding; do not merge several actions into one item and do not repeat
+  the same one. Keep the order of the document.
+- Each item is a short phrase or sentence copied or closely cut from the document's own wording, in its
+  original language and script (never translated or paraphrased into another language), keeping the date,
+  place, officer, or item names that the same sentence gives. Never add details the document does not state.
+- If the document records no such actions or findings (for example a standalone application), return [].
+
 DOCUMENT CLASSIFICATION: besides the 15 fields, set "document_class" in the metadata object to exactly
 one of: FIR, APPLICATION, OTHER, UNCLEAR.
 - FIR: an official First Information Report REGISTERED by the police (प्रथम सूचना रिपोर्ट / First
@@ -194,6 +211,33 @@ Decide from the overall structure and context of the whole document, never from 
 "FIR" or an FIR number appearing in a document do NOT make it an FIR. Choose FIR only when you are
 confident the document is the official registered FIR itself; if unsure choose UNCLEAR. Classification
 never changes how the 15 fields are extracted.
+
+CASE FIELDS: also fill these metadata fields (null when the document does not support them; never guess):
+- fir_date: the date the FIR was registered, as YYYY-MM-DD (null for a document that is not an FIR, or when
+  the day/month order is unclear). Indian documents write dates day first (DD/MM/YYYY); Devanagari digits
+  count as digits. Do not confuse it with the incident date.
+- incident_date: the date the incident happened, as YYYY-MM-DD under the same rules (the existing
+  incident_date_time keeps the original wording).
+- title: a short label for the case or document, at most 10 words, built only from the document (for
+  example its subject / विषय line or the offence it is about), in the document's language; null if unclear.
+- case_type: exactly one of CRIMINAL, CYBER_CRIME, FINANCIAL_FRAUD, CORRUPTION_BRIBERY, NARCOTICS,
+  DOMESTIC_VIOLENCE, CIVIL, COMMERCIAL_DISPUTE, BREACH_OF_CONTRACT, PROPERTY_DISPUTE, DEBT_RECOVERY,
+  INTELLECTUAL_PROPERTY, REGULATORY_COMPLIANCE, DATA_PRIVACY_BREACH, ANTITRUST_COMPETITION,
+  ENVIRONMENTAL_VIOLATION, TAXATION_CUSTOMS, EMPLOYMENT_DISPUTE, WORKPLACE_HARASSMENT, WAGE_AND_HOUR,
+  CONSUMER_PROTECTION, FAMILY_AND_MATRIMONIAL, ARBITRATION_MEDIATION, INSOLVENCY_BANKRUPTCY, OTHER, or null.
+  Decide from the incident facts and the legal sections together, never from one keyword, and prefer the
+  most specific category the evidence supports (e.g. online/digital fraud or IT Act sections -> CYBER_CRIME;
+  cheating or misappropriation of money -> FINANCIAL_FRAUD; NDPS Act -> NARCOTICS; Prevention of
+  Corruption Act or bribery -> CORRUPTION_BRIBERY; cruelty by husband or relatives / Domestic Violence Act
+  -> DOMESTIC_VIOLENCE). Use CRIMINAL for an ordinary offence such as theft, assault or murder that fits no
+  more specific category, OTHER when the case is clear but fits none of the categories, and null when there
+  is not enough information. Do not default to CRIMINAL.
+- case_status: exactly one of ASSIGNED, UNDER_INVESTIGATION, CHARGE_SHEET_FILED, CLOSED, or null. Use
+  UNDER_INVESTIGATION only when the document explicitly says the investigation is ongoing or pending,
+  CHARGE_SHEET_FILED only when it says a charge sheet / final report has been filed, CLOSED only when it
+  says the case is closed (final report / closure accepted), ASSIGNED only when it explicitly says the case
+  has been assigned to an officer. The mere existence of an FIR, or routine registration wording, is not a
+  status: then null.
 
 APPLICATION LOCATION: also report WHERE an application/complaint letter is, as "application_location"
 (location only: never output the application text). Fields: found (bool), start_page, end_page (page
@@ -231,7 +275,8 @@ COMBINED_PROMPT = (
 ADDITIONALLY, in the same JSON response fill the "metadata" object, extracted ONLY from the text you
 transcribed above (never from outside knowledge). Copy metadata values from the document in their original
 script; do not translate or transliterate them. The metadata object must use exactly the 15 field names
-listed below plus document_class. Metadata rules:
+listed below plus document_class and the fields defined under CASE FIELDS (fir_date, incident_date, title,
+case_type, case_status). Metadata rules:
 
 """
     + _METADATA_RULES

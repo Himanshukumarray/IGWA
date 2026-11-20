@@ -118,6 +118,14 @@ def _is_fir(metadata: OCRMetadata | None, job_id: str) -> bool:
     return False
 
 
+def _finalize_metadata(metadata: OCRMetadata, pages: list[OCRPage], job_id: str) -> tuple[OCRMetadata, bool]:
+    """Python-owned metadata: application text and fir_document (the uploaded document's id when the
+    document is an FIR; any value the model sent is discarded). Returns (metadata, isFir)."""
+    is_fir = _is_fir(metadata, job_id)
+    metadata = attach_application(metadata, pages, job_id)
+    return metadata.model_copy(update={"fir_document": job_id if is_fir else None}), is_fir
+
+
 def _note_groq_fallback(job: str) -> None:
     """Metric + log: Groq is being used because Gemini could not serve the request."""
     gemini_key_manager.get_manager().record_groq_fallback()
@@ -206,10 +214,10 @@ async def process_ocr(file: UploadFile) -> OCRResultResponse:
     has_text = bool(ocr_data.full_text.strip())
     if has_text and metadata is not None:
         # Same-call location -> application text cut from pages[] in Python (no extra request).
-        metadata = attach_application(metadata, ocr_data.pages, document_id)
+        metadata, is_fir = _finalize_metadata(metadata, ocr_data.pages, document_id)
         metadata_state = dict(
             metadata=metadata, metadata_model=ocr_model, metadata_status=MetadataStatus.COMPLETED,
-            isFir=_is_fir(metadata, document_id),
+            isFir=is_fir,
         )
     else:  # no usable same-call metadata: extract in the background from the OCR text
         metadata_state = dict(
@@ -326,15 +334,14 @@ async def process_metadata_background(
         logger.warning("job=%s Document classification failed (metadata unavailable): isFir defaults to false",
                        job_id)
     else:
-        if pages:
-            metadata = attach_application(metadata, pages, job_id)
+        metadata, is_fir = _finalize_metadata(metadata, pages or [], job_id)
         _update_job(
             job_id,
             metadata=metadata,
             metadata_model=model,
             metadata_status=MetadataStatus.COMPLETED,
             metadata_error=None,
-            isFir=_is_fir(metadata, job_id),
+            isFir=is_fir,
         )
         logger.info("job=%s Metadata completed provider=%s duration=%.2fs", job_id, model, elapsed)
 

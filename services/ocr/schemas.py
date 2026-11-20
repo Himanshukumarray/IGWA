@@ -1,5 +1,6 @@
+import re
 import time
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -25,6 +26,83 @@ class MetadataStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+class CASE_STATUS(str, Enum):
+    ASSIGNED = "ASSIGNED"
+    UNDER_INVESTIGATION = "UNDER_INVESTIGATION"
+    CHARGE_SHEET_FILED = "CHARGE_SHEET_FILED"
+    CLOSED = "CLOSED"
+
+
+class CaseType(str, Enum):
+    CRIMINAL = "CRIMINAL"
+    CYBER_CRIME = "CYBER_CRIME"
+    FINANCIAL_FRAUD = "FINANCIAL_FRAUD"
+    CORRUPTION_BRIBERY = "CORRUPTION_BRIBERY"
+    NARCOTICS = "NARCOTICS"
+    DOMESTIC_VIOLENCE = "DOMESTIC_VIOLENCE"
+
+    CIVIL = "CIVIL"
+    COMMERCIAL_DISPUTE = "COMMERCIAL_DISPUTE"
+    BREACH_OF_CONTRACT = "BREACH_OF_CONTRACT"
+    PROPERTY_DISPUTE = "PROPERTY_DISPUTE"
+    DEBT_RECOVERY = "DEBT_RECOVERY"
+    INTELLECTUAL_PROPERTY = "INTELLECTUAL_PROPERTY"
+
+    REGULATORY_COMPLIANCE = "REGULATORY_COMPLIANCE"
+    DATA_PRIVACY_BREACH = "DATA_PRIVACY_BREACH"
+    ANTITRUST_COMPETITION = "ANTITRUST_COMPETITION"
+    ENVIRONMENTAL_VIOLATION = "ENVIRONMENTAL_VIOLATION"
+    TAXATION_CUSTOMS = "TAXATION_CUSTOMS"
+
+    EMPLOYMENT_DISPUTE = "EMPLOYMENT_DISPUTE"
+    WORKPLACE_HARASSMENT = "WORKPLACE_HARASSMENT"
+    WAGE_AND_HOUR = "WAGE_AND_HOUR"
+
+    CONSUMER_PROTECTION = "CONSUMER_PROTECTION"
+    FAMILY_AND_MATRIMONIAL = "FAMILY_AND_MATRIMONIAL"
+    ARBITRATION_MEDIATION = "ARBITRATION_MEDIATION"
+    INSOLVENCY_BANKRUPTCY = "INSOLVENCY_BANKRUPTCY"
+    OTHER = "OTHER"
+
+
+_DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+
+def normalize_iso_date(value: Any) -> str | None:
+    """YYYY-MM-DD for a date that is unambiguous, else None (never a guess).
+
+    Accepts an ISO date (optionally followed by a time) and DD/MM/YYYY, DD-MM-YYYY or DD.MM.YYYY only
+    when the day is above 12, so the order cannot be mistaken. Devanagari digits are converted.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().translate(_DEVANAGARI_DIGITS)
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s].*)?$", text)
+    if m:
+        y, mo, d = (int(g) for g in m.groups())
+    else:
+        m = re.match(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?:[T\s,].*)?$", text)
+        if not m:
+            return None
+        d, mo, y = (int(g) for g in m.groups())
+        if d <= 12:
+            return None
+    try:
+        return date(y, mo, d).isoformat()
+    except ValueError:
+        return None
+
+
+def _normalize_enum(enum_cls: type[Enum], value: Any) -> Any:
+    """Exact enum member or None: an unsupported value must not invalidate the other fields."""
+    if isinstance(value, enum_cls):
+        return value
+    if not isinstance(value, str):
+        return None
+    key = re.sub(r"[\s-]+", "_", value.strip()).upper()
+    return key if key in enum_cls.__members__ else None
+
 
 class ApplicationLocation(BaseModel):
     """Where the model says the attached application/complaint is. Locations only, never text.
@@ -76,10 +154,44 @@ class OCRMetadata(BaseModel):
 
     document_narrative: str | None = None
 
-    investigation_actions_findings: list[str] = Field(default_factory=list)
+    investigation_actions_findings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Distinct steps the police actually took and findings they recorded, one short item each, "
+            "in the document's own words and script, in document order. Not allegations, not the "
+            "incident story, not requests. Empty list if none are stated."
+        ),
+    )
+
+    # Case-management fields. Existing equivalents are kept as they are: accused_names (= accused
+    # persons) and incident_date_time; incident_date is the normalized date-only form.
+    fir_date: str | None = None  # YYYY-MM-DD, only for the date the FIR was registered
+    case_type: CaseType | None = None
+    case_status: CASE_STATUS | None = None
+    incident_date: str | None = None  # YYYY-MM-DD
+    title: str | None = None
+
+    # Public, set by Python (never by the model; kept out of the model schema): the uploaded
+    # document's id when the document is an FIR, so it is never an OCR-generated value.
+    fir_document: SkipJsonSchema[str | None] = None
+
+    @field_validator("fir_date", "incident_date", mode="before")
+    @classmethod
+    def _normalize_dates(cls, value: Any) -> str | None:
+        return normalize_iso_date(value)
+
+    @field_validator("case_type", mode="before")
+    @classmethod
+    def _validate_case_type(cls, value: Any) -> Any:
+        return _normalize_enum(CaseType, value)
+
+    @field_validator("case_status", mode="before")
+    @classmethod
+    def _validate_case_status(cls, value: Any) -> Any:
+        return _normalize_enum(CASE_STATUS, value)
 
     # Internal: the model's document classification, used only to derive the API's isFir flag.
-    # exclude=True keeps the public metadata object at exactly the 15 fields above.
+    # exclude=True keeps it out of the public metadata object.
     document_class: Literal["FIR", "APPLICATION", "OTHER", "UNCLEAR"] | None = Field(
         default=None, exclude=True
     )

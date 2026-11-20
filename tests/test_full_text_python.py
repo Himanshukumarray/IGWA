@@ -193,4 +193,4 @@ def test_http_response_contract_is_unchanged(env):
         assert key in body
     assert set(body["ocr_data"]) == {"pages", "full_text"} and body["ocr_data"]["full_text"] == EN
     assert body["ocr_data"]["pages"] == [{"page_number": 1, "text": EN}]
-    assert body["metadata_status"] == "completed" and len(body["metadata"]) == 16 and "application" in body["metadata"]
+    assert body["metadata_status"] == "completed" and len(body["metadata"]) == 22 and "application" in body["metadata"]
