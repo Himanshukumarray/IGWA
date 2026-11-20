@@ -138,7 +138,10 @@ _METADATA_JSON_SHAPE = """Return ONLY one JSON object with exactly these keys:
 "investigating_officer": string|null, "legal_sections": [string],
 "complainant_name": string|null, "accused_names": [string], "witness_names": [string],
 "incident_date_time": string|null, "incident_location": string|null,
-"document_narrative": string|null, "investigation_actions_findings": [string]}
+"document_narrative": string|null, "investigation_actions_findings": [string],
+"document_class": "FIR"|"APPLICATION"|"OTHER"|"UNCLEAR",
+"application_location": {"found": boolean, "start_page": integer|null, "end_page": integer|null,
+"start_text": string|null, "end_text": string|null}|null}
 Use null for missing single values and [] for missing lists. No commentary."""
 
 def _parse_metadata_json(text: str | None) -> dict[str, Any]:

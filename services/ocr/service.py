@@ -5,11 +5,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import fitz
 from fastapi import BackgroundTasks, HTTPException, UploadFile
 from pydantic import ValidationError
 
 from config.settings import Settings, get_settings
 from services.ocr import gemini_client, gemini_key_manager, groq_client, utils
+from services.ocr.application import attach_application, build_marked_text
 from services.ocr.gemini_client import GeminiMetadataError, GeminiOCRError
 from services.ocr.groq_client import GroqMetadataError, GroqOCRError
 from services.ocr.schemas import (
@@ -17,6 +19,7 @@ from services.ocr.schemas import (
     MetadataStatusResponse,
     OCRData,
     OCRMetadata,
+    OCRPage,
     OCRResultResponse,
     OCRStatus,
     OCRUploadResponse,
@@ -96,6 +99,25 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)  # separate seam so tests can skip real backoff delays
 
 
+def _is_fir(metadata: OCRMetadata | None, job_id: str) -> bool:
+    """isFir from the model's classification. True only for a confident FIR.
+
+    APPLICATION/OTHER are confirmed non-FIR (false). A missing or UNCLEAR classification also
+    yields false, but is logged as an unresolved classification so it is never mistaken for a
+    confirmed non-FIR.
+    """
+    label = metadata.document_class if metadata is not None else None
+    if label == "FIR":
+        logger.info("job=%s Document classified as FIR", job_id)
+        return True
+    if label in ("APPLICATION", "OTHER"):
+        logger.info("job=%s Document classified as non-FIR (%s)", job_id, label)
+        return False
+    logger.warning("job=%s Document classification unresolved (%s): isFir defaults to false",
+                   job_id, label or "missing")
+    return False
+
+
 def _note_groq_fallback(job: str) -> None:
     """Metric + log: Groq is being used because Gemini could not serve the request."""
     gemini_key_manager.get_manager().record_groq_fallback()
@@ -112,6 +134,23 @@ def _remote_providers(s: Settings) -> list[tuple[str, Any, str, int]]:
     return providers
 
 
+def _expected_page_count(payload: bytes, mime: str) -> int | None:
+    """Pages in the upload (None if it cannot be counted, e.g. a corrupt PDF: check is skipped)."""
+    if mime != "application/pdf":
+        return 1
+    try:
+        with fitz.open(stream=payload, filetype="pdf") as doc:
+            return doc.page_count or None
+    except Exception:
+        return None
+
+
+def _verify_all_pages(data: OCRData, expected: int | None) -> None:
+    """Reject a response that skipped, duplicated or invented pages (it falls back to Groq)."""
+    if expected is not None and [p.page_number for p in data.pages] != list(range(1, expected + 1)):
+        raise ValueError("provider did not return every page exactly once")
+
+
 async def _remote_whole_document(
     payload: bytes, mime: str, document_id: str, s: Settings
 ) -> tuple[OCRData, str, str, OCRMetadata | None]:
@@ -125,11 +164,18 @@ async def _remote_whole_document(
             _note_groq_fallback(document_id)
         try:
             logger.info("%s OCR started: document_id=%s", name, document_id)
+            call_started = time.perf_counter()
             raw = await _call_remote(extract, payload, mime, retries, s)
-            data = ocr_data_from_dict(raw)
+            call_seconds = time.perf_counter() - call_started
+            timings: dict[str, float] = {}
+            data = ocr_data_from_dict(raw, timings)
+            _verify_all_pages(data, _expected_page_count(payload, mime))
             metadata = metadata_from_dict(raw) if name == "gemini" else None
-            logger.info("%s OCR completed: document_id=%s metadata_in_same_call=%s",
-                        name, document_id, metadata is not None)
+            logger.info(
+                "job=%s OCR timing: provider=%s call=%.2fs parse_validate=%.3fs full_text_join=%.4fs "
+                "pages=%d chars=%d metadata_in_same_call=%s",
+                document_id, name, call_seconds, timings["parse"], timings["full_text"],
+                len(data.pages), len(data.full_text), metadata is not None)
             return data, model, name, metadata
         except _REMOTE_ERRORS as exc:
             failures.append(f"{name}={_error_category(exc)}")
@@ -159,7 +205,12 @@ async def process_ocr(file: UploadFile) -> OCRResultResponse:
     now = _now()
     has_text = bool(ocr_data.full_text.strip())
     if has_text and metadata is not None:
-        metadata_state = dict(metadata=metadata, metadata_model=ocr_model, metadata_status=MetadataStatus.COMPLETED)
+        # Same-call location -> application text cut from pages[] in Python (no extra request).
+        metadata = attach_application(metadata, ocr_data.pages, document_id)
+        metadata_state = dict(
+            metadata=metadata, metadata_model=ocr_model, metadata_status=MetadataStatus.COMPLETED,
+            isFir=_is_fir(metadata, document_id),
+        )
     else:  # no usable same-call metadata: extract in the background from the OCR text
         metadata_state = dict(
             metadata_status=MetadataStatus.PENDING if has_text else MetadataStatus.SKIPPED,
@@ -186,6 +237,7 @@ async def process_upload(
     file: UploadFile, background_tasks: BackgroundTasks
 ) -> OCRUploadResponse:
     """Run OCR, store the job, schedule metadata extraction and return immediately."""
+    request_started = time.perf_counter()
     record = await process_ocr(file)
     job_id = record.document_id
     if record.metadata_status == MetadataStatus.COMPLETED:
@@ -194,13 +246,14 @@ async def process_upload(
     elif record.metadata_status == MetadataStatus.PENDING:
         # Only the OCR text is passed on: no UploadFile, file bytes or request state.
         background_tasks.add_task(
-            process_metadata_background, job_id, record.ocr_data.full_text
+            process_metadata_background, job_id, record.ocr_data.full_text, record.ocr_data.pages
         )
         logger.info("job=%s Metadata scheduled", job_id)
         message = "OCR completed; metadata extraction is running in the background"
     else:
         logger.warning("job=%s Metadata skipped (empty OCR text)", job_id)
         message = "OCR completed; no text found so metadata extraction was skipped"
+    logger.info("job=%s OCR API total response time=%.2fs", job_id, time.perf_counter() - request_started)
     return OCRUploadResponse(
         message=message,
         **record.model_dump(exclude={"success", "created_at", "updated_at"}),
@@ -243,9 +296,17 @@ def _update_job(job_id: str, **changes: object) -> None:
         ocr_results[job_id] = record.model_copy(update={**changes, "updated_at": _now()})
 
 
-async def process_metadata_background(job_id: str, ocr_text: str) -> None:
-    """Background task: extract metadata for a stored job and always reach a terminal status."""
+async def process_metadata_background(
+    job_id: str, ocr_text: str, pages: list[OCRPage] | None = None
+) -> None:
+    """Background task: extract metadata for a stored job and always reach a terminal status.
+
+    With `pages`, the metadata request sees page markers, reports where the application is, and
+    Python cuts the application text from those pages (still one metadata request).
+    """
     started = time.monotonic()
+    if pages:
+        ocr_text = build_marked_text(pages)
     _update_job(job_id, metadata_status=MetadataStatus.PROCESSING)
     logger.info("job=%s Metadata processing started", job_id)
     try:
@@ -259,15 +320,21 @@ async def process_metadata_background(job_id: str, ocr_text: str) -> None:
             job_id,
             metadata_status=MetadataStatus.FAILED,
             metadata_error="Metadata extraction could not be completed.",
+            isFir=False,
         )
         logger.error("job=%s Metadata failed duration=%.2fs", job_id, elapsed)
+        logger.warning("job=%s Document classification failed (metadata unavailable): isFir defaults to false",
+                       job_id)
     else:
+        if pages:
+            metadata = attach_application(metadata, pages, job_id)
         _update_job(
             job_id,
             metadata=metadata,
             metadata_model=model,
             metadata_status=MetadataStatus.COMPLETED,
             metadata_error=None,
+            isFir=_is_fir(metadata, job_id),
         )
         logger.info("job=%s Metadata completed provider=%s duration=%.2fs", job_id, model, elapsed)
 
@@ -280,6 +347,7 @@ def get_metadata_status(job_id: str) -> MetadataStatusResponse:
         metadata=record.metadata,
         metadata_provider=record.metadata_model,
         metadata_error=record.metadata_error,
+        isFir=record.isFir,
     )
 
 

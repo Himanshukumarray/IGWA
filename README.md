@@ -163,3 +163,28 @@ request only to the next key; nothing is re-processed locally. `/health` shows o
 `gemini_keys: {configured, available}`. Logs use slot numbers (`Gemini credential slot 2: quota exhausted`).
 Limits: cooldown/disabled state is per process and resets on restart; a hung connection is bounded by the
 per-attempt timeout, not a separate connect timeout (the SDK transport differs by environment).
+
+### isFir (FIR vs application)
+
+Every response (`POST /python/ocr/upload`, `GET /python/ocr/{id}`, `GET /python/ocr/{job_id}/metadata`) has a
+boolean `isFir` right after `metadata_error`. It comes from a `document_class` value
+(`FIR` / `APPLICATION` / `OTHER` / `UNCLEAR`) that Gemini returns inside the same request as the OCR and metadata
+(or from the text-only Gemini/Groq metadata fallback). `isFir` is `true` only for `FIR`. An application that
+quotes an FIR number is `APPLICATION`; an official FIR form followed by attached letters is still `FIR`.
+Missing/`UNCLEAR`/invalid classification gives `false` and a "classification unresolved" log line (a confirmed
+non-FIR logs as "classified as non-FIR"). While metadata is still pending, `isFir` is `false` until the
+background step completes. `document_class` itself is internal and never appears in the `metadata` object.
+
+### metadata.application (attached application/complaint)
+
+`metadata.application` is `{found, start_page, end_page, text}`. The model only reports *where* the application is
+(`application_location`: page range, plus short verbatim `start_text`/`end_text` quotes when it starts/ends
+mid-page) in the existing single Gemini request (or the existing background metadata request after Groq OCR, where
+pages are marked `[[PAGE n]]`). `text` is cut from `ocr_data.pages` in Python (`services/ocr/application.py`):
+nothing is regenerated and no extra model call is made.
+
+- `found=false` (all other fields `null`): confirmed no application.
+- `found=true`, `text=null`: located, but a mid-page boundary quote was not found verbatim, so no text is
+  returned rather than risk returning FIR text.
+- `application=null` (or `metadata=null` while pending/failed): unavailable, e.g. the model returned no/invalid
+  location. This is never reported as "no application".
