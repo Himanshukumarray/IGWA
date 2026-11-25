@@ -143,26 +143,87 @@ so review critical identifiers. Encrypted/corrupt files are rejected by the prov
 
 ### Gemini API key failover
 
-`services/ocr/gemini_key_manager.py` tries credentials strictly in configured order, one request at a time,
-for both OCR escalation and background metadata. Configure `GEMINI_API_KEYS=k1,k2,...` or
-`GEMINI_API_KEY_1..10` (precedence: list > numbered > legacy `GEMINI_API_KEY`; placeholders and duplicates are
-ignored). Placing keys in `.env` is the only supported way: nothing is hardcoded and keys are never logged.
+`services/ocr/gemini_key_manager.py` picks keys per request, one at a time, for both OCR and background
+metadata. With `GEMINI_KEY_SELECTION=random` (default) every request shuffles the currently healthy keys
+(sampling without replacement, so a failed key is never retried in the same request) and walks that order
+until a valid result arrives; `ordered` keeps the configured order. Configure `GEMINI_API_KEYS=k1,k2,...` (any
+number) or `GEMINI_API_KEY_1..10` (precedence: list > numbered > legacy `GEMINI_API_KEY`; placeholders and
+duplicates are ignored). Keys live only in `.env`: nothing is hardcoded and keys are never logged (logs use
+`Key-N`). `reload_manager()` re-reads the settings and keeps the health of surviving keys.
 
 | Failure | Action |
 | --- | --- |
-| 401, "API key not valid/expired/leaked" (the Gemini API reports an invalid key as HTTP 400) | key disabled for the process; next key immediately |
+| 401, "API key not valid/expired/leaked" (the Gemini API reports an invalid key as HTTP 400) | key disabled until the process restarts / `check_keys` succeeds; next key immediately |
 | 402 billing, 403 permission | key cooldown (default 1h); next key |
 | 429 | cooldown = `Retry-After` (else 60s); daily quota = 1h; next key |
-| DNS/network, timeout, 5xx/overload | **no rotation**: one request, then fast-fail for 10s (goes to Groq) |
-| 400/404/413 (bad request, wrong model) | **no rotation**, no key penalized |
-| all keys unavailable | Groq (existing fallback) |
+| 5xx, timeout, network | key benched for `GEMINI_SHARED_FAILURE_COOLDOWN_SECONDS`; next key, but after `GEMINI_SHARED_FAILOVER_MAX_KEYS` distinct keys fail this way the provider counts as down: stop, fast-fail for the cooldown, go to Groq |
+| 400 (invalid PDF / bad request), 413 | **no rotation**, no key penalized (the same request fails on every key) |
+| 404 model not found | confirmed on one other key, then stop (a wrong model name would fail everywhere) |
+| empty / truncated / invalid-JSON / schema-invalid / error-only / bad-finish-reason response | next key (max `GEMINI_MAX_INVALID_RESPONSE_ATTEMPTS`), key not cooled down |
+| response only skips pages | only the missing pages are re-OCRed (one sub-PDF call) and merged in page order |
+| repeated truncation of a multi-page PDF | page-by-page OCR |
+| all keys unavailable / Gemini down | Groq (existing fallback) |
 
-SDK-internal retries are disabled (`attempts=1`) so failover is the only retry layer; each attempt has
-`GEMINI_REQUEST_TIMEOUT_SECONDS`, the whole chain `GEMINI_OVERALL_BUDGET_SECONDS`. Switching keys re-sends the same
-request only to the next key; nothing is re-processed locally. `/health` shows only
-`gemini_keys: {configured, available}`. Logs use slot numbers (`Gemini credential slot 2: quota exhausted`).
-Limits: cooldown/disabled state is per process and resets on restart; a hung connection is bounded by the
-per-attempt timeout, not a separate connect timeout (the SDK transport differs by environment).
+SDK-internal retries are disabled (`attempts=1`) so failover is the only retry layer; there is no sleep between
+keys (`GEMINI_FAILOVER_DELAY_SECONDS=0`). Failure *detection* is bounded by `GEMINI_REQUEST_TIMEOUT_SECONDS` per
+attempt, the Gemini chain by `GEMINI_OVERALL_BUDGET_SECONDS`, Gemini + Groq by `OCR_OVERALL_DEADLINE_SECONDS`; the
+*switch* itself takes well under a millisecond. Per-key health (counters, last error, cooldown expiry, average
+latency, active requests) is available from `get_manager().snapshot()`; `/health` shows only
+`gemini_keys: {configured, available}`. Every request logs `[OCR] request=<id> ...` lines (order, attempt,
+`Key-N`, category, timing) and a final `Status: SUCCESS|FAILED` line, never document text.
+Limits: cooldown/health state is per process (each uvicorn worker has its own view; no shared store is used) and
+resets on restart; results are in memory, so a failed upload (502) is not stored: the client still has the file and
+must re-upload. A hung connection is bounded by the per-attempt timeout, not a separate connect timeout.
+
+### Parallel batch OCR (multi-page PDFs)
+
+A PDF that needs more than one batch (more than `OCR_BATCH_SIZE` = 5 pages; smaller batches for scanned/heavy PDFs,
+see `OCR_HEAVY_PAGE_BYTES`) is cut into page batches by `services/ocr/batch_ocr.py` (PyMuPDF `insert_pdf`: pages are
+copied, not re-rendered) and OCRed concurrently on different Gemini keys. Documents of up to one batch, images and
+`OCR_BATCH_PROCESSING_ENABLED=false` keep the single-request path above (which also returns the metadata in the same
+call). The API, request and response format are unchanged: the frontend never sees batches, keys or retries.
+
+* **Allocation.** `healthy keys -> active batches / standby`: 6->4/2, 5->3/2, 4->2/2, 3->2/1, 2->1/1, 1->1/0, 0->0/0
+  (`OCR_MAX_PARALLEL_BATCHES`, `GEMINI_RESERVED_KEYS`; nothing is hardcoded to six keys or four batches). Keys are chosen
+  randomly among the eligible ones (not disabled, not cooling down, not at their cap). Standby keys are simply the
+  healthy keys the document's workers do not occupy: a failed batch takes one of them at once, and recovery work is
+  queued ahead of fresh batches. When a batch finishes the next one starts immediately (no waves).
+* **Strict limits** (process-local, see limits below): `GEMINI_MAX_CONCURRENT_PER_KEY` (default 1; a key at its cap is
+  never handed out), `OCR_GLOBAL_MAX_CONCURRENT_BATCHES` (all documents together; 10 uploads x 4 batches never become 40
+  requests), workers per document. Waiting batches are served first come first served, so one large document cannot
+  starve a small one. Reservations are released after success, failure and cancellation.
+* **Failure handling per batch** (nothing else restarts; validated pages are kept in a registry keyed by original page
+  number and are never overwritten):
+
+| Batch failure | Action |
+| --- | --- |
+| billing / auth / 403 | key excluded as before (cooldown / disabled); another key at once |
+| 429 | cooldown from `Retry-After`; another key, **unless a second key is also rate limited**: then a shared project quota is assumed, the document pauses briefly, halves its concurrency and stops rotating (Groq / failure) |
+| 5xx, network | key benched briefly; another key; no provider-wide circuit breaker from batch traffic |
+| processing timeout (adaptive, see below), truncation, rejected input (400/413) | batch is split in halves (5 -> 2 + 3 ...) down to single pages (`OCR_BATCH_MIN_SIZE`); the key is **not** penalized |
+| empty / invalid JSON / schema / error-only / bad page numbers | another key (max `GEMINI_MAX_INVALID_RESPONSE_ATTEMPTS`), then split |
+| response skips pages | valid pages kept, only the missing pages are redone |
+| no eligible key left, or Gemini recovery exhausted | **only that batch** goes to Groq (per-page images, SDK retries off, `OCR_GROQ_MAX_CONCURRENT`) |
+| still incomplete, or the overall deadline passes | HTTP 502 as before; nothing is stored, no partial result is returned |
+
+* **Adaptive timeout.** `OCR_BATCH_TIMEOUT_SECONDS` (90) is the budget of a full batch; it scales with pages and PDF
+  size, tightens with latency measured earlier in the request, stays within `OCR_BATCH_TIMEOUT_MAX_SECONDS` and the
+  remaining budget (`OCR_OVERALL_DEADLINE_SECONDS` minus `OCR_METADATA_RESERVE_SECONDS`). A timeout caused by the
+  application's own remaining budget is nobody's fault and counts against no key.
+* **Merge and metadata.** Pages are mapped from batch-local to original numbers, checked (all present, none duplicated),
+  and `full_text` is built in Python (`build_full_text`); no LLM rewrites text. Batches do not extract metadata. After the
+  merge one metadata extraction runs on the page-marked full text (`OCR_METADATA_AFTER_MERGE`), still inside the upload
+  request like the single-call path, so `metadata_status` is normally `completed` in the upload response. If it does not
+  finish in time it falls back to the existing background task (`pending`, poll `/metadata`).
+* **Limits.** Progress lives in memory only: a restart or a terminal failure loses it and the client must re-upload
+  (durable recovery would need stored PDFs, a job queue and a status endpoint: not built, needs approval). The caps are
+  per process: with N uvicorn workers the real ceiling is N times higher, and keys of one Google project share one quota.
+  Cancelling a request cancels the local calls; Gemini/Groq may still finish a request they already received. Very large
+  documents are sent whole to the metadata model (no chunked aggregation yet). `GEMINI_OVERALL_BUDGET_SECONDS` and
+  `GEMINI_SHARED_FAILOVER_MAX_KEYS` still govern the single-request path; batches use `OCR_OVERALL_DEADLINE_SECONDS` and
+  `GEMINI_SHARED_FAILOVER_MAX_KEYS` as the number of distinct keys a batch tries after 5xx/network errors.
+* **Benchmarks.** `python benchmarks/benchmark_ocr_batches.py` (mocked, no network) and
+  `python benchmarks/live_ocr_check.py file.pdf` (real calls, run deliberately).
 
 ### isFir (FIR vs application)
 

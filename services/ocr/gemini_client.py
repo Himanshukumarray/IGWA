@@ -1,9 +1,12 @@
+import asyncio
+import contextvars
 import json
 import logging
 import re
 import time
 from typing import Any
 
+import fitz
 from google import genai
 from google.genai import types
 
@@ -11,7 +14,7 @@ from config.settings import get_settings
 from pydantic import ValidationError
 
 from services.ocr import gemini_key_manager as key_manager
-from services.ocr.schemas import GeminiOCRResult, OCRMetadata
+from services.ocr.schemas import GeminiOCRResult, OCRMetadata, ocr_data_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -87,40 +90,206 @@ def parse_gemini_json(text: str | None) -> dict[str, Any]:
         raise GeminiOCRError("Gemini response had unexpected structure")
     return parsed
 
-async def extract_text(data: bytes, mime_type: str) -> dict[str, Any]:
-    """Send a document (PDF or image) to Gemini and return the parsed OCR dict.
+# Page count of the document being OCRed, set once by the service (single source of truth). Unset:
+# extract_text counts the pages itself. None: unknown, page checks are skipped.
+_UNSET: Any = object()
+expected_pages_var: contextvars.ContextVar[Any] = contextvars.ContextVar("ocr_expected_pages", default=_UNSET)
 
-    Credentials are tried in configured order by the key manager; shared outages and malformed
-    requests stop immediately instead of rotating through every key.
-    """
+_OK_FINISH = {"", "NONE", "STOP", "FINISH_REASON_UNSPECIFIED"}
+_PAGEWISE_CATEGORIES = {"truncated", "invalid_json", "schema_validation"}
+_PAGEWISE_CONCURRENCY = 3
+
+
+def _finish_name(response: Any) -> str:
+    candidates = getattr(response, "candidates", None) or []
+    reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+    if reason is None:
+        return ""
+    return str(getattr(reason, "name", reason)).rsplit(".", 1)[-1].upper()
+
+
+def count_pages(data: bytes, mime_type: str) -> int | None:
+    """Pages in the upload (1 for an image); None when it cannot be counted."""
+    if mime_type != "application/pdf":
+        return 1
+    try:
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            return doc.page_count or None
+    except Exception:
+        return None
+
+
+def _sub_pdf(data: bytes, pages: list[int]) -> bytes:
+    """A PDF holding only the given 1-based pages of `data`, in the given order."""
+    with fitz.open(stream=data, filetype="pdf") as src, fitz.open() as out:
+        for number in pages:
+            out.insert_pdf(src, from_page=number - 1, to_page=number - 1)
+        return out.tobytes()
+
+
+def _make_validator(expected: int | None, allow_missing: bool, box: dict[str, Any]):
+    """Build the response check run by the key manager. Unusable output raises InvalidResponse, which
+    makes the manager try another key. A parsed response that only MISSES pages is accepted when
+    allow_missing (the caller re-OCRs just those pages); `box` receives the parsed dict."""
+    Invalid = key_manager.InvalidResponse
+
+    def validate(response: Any) -> None:
+        finish = _finish_name(response)
+        if finish == "MAX_TOKENS":
+            raise Invalid("response truncated", "truncated")
+        if finish not in _OK_FINISH:
+            raise Invalid(f"unexpected finish reason {finish}", "unexpected_finish_reason")
+        text = getattr(response, "text", None)
+        if not text or not text.strip():
+            raise Invalid("empty response", "empty_response")
+        try:
+            parsed = parse_gemini_json(text)
+        except GeminiOCRError as exc:
+            raise Invalid("invalid JSON", "invalid_json") from exc
+        if not parsed.get("pages") and "error" in parsed:
+            raise Invalid("error message instead of OCR text", "error_response")
+        try:
+            data = ocr_data_from_dict(parsed)
+        except (ValidationError, ValueError) as exc:
+            raise Invalid("schema validation failed", "schema_validation") from exc
+        if not data.pages:
+            raise Invalid("no pages", "no_pages")
+        if expected is not None:
+            numbers = [p.page_number for p in data.pages]
+            if len(set(numbers)) != len(numbers) or any(n < 1 or n > expected for n in numbers):
+                raise Invalid("duplicate or out-of-range pages", "bad_page_numbers")
+            if len(numbers) != expected and not allow_missing:
+                raise Invalid("pages missing", "missing_pages")
+        box["parsed"] = parsed
+
+    return validate
+
+
+def make_batch_validator(expected: int, allow_missing: bool, box: dict[str, Any]):
+    """Response check for one OCR batch (local page numbers 1..expected). Same rules as the
+    whole-document validator; a response that only MISSES pages passes when allow_missing."""
+    return _make_validator(expected, allow_missing, box)
+
+
+def build_batch_call(data: bytes, timeout: float):
+    """`call(client)` for one PDF batch: plain OCR prompt (no metadata: that runs once after the merge).
+    The per-request SDK timeout is a little above the scheduler's own timeout, so the scheduler's
+    asyncio timeout is always the one that fires (classified as a processing timeout)."""
+    settings = get_settings()
+
+    def call(client):
+        return client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=[types.Part.from_bytes(data=data, mime_type="application/pdf"), OCR_PROMPT],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=GeminiOCRResult,
+                http_options=types.HttpOptions(timeout=int((timeout + 5.0) * 1000)),
+            ),
+        )
+
+    return call
+
+
+async def _run_once(data: bytes, mime_type: str, prompt: str, expected: int | None, allow_missing: bool,
+                    deadline: float, purpose: str = "ocr") -> dict[str, Any]:
+    """One manager-driven OCR call (own key failover) -> validated parsed dict."""
     settings = get_settings()
     manager = key_manager.get_manager()
-    api_started = time.perf_counter()
-    try:
-        response = await manager.execute(
-            lambda client: client.aio.models.generate_content(
-                model=settings.gemini_model,
-                contents=[
-                    types.Part.from_bytes(data=data, mime_type=mime_type),
-                    COMBINED_PROMPT,
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=GeminiOCRResult,
-                ),
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _fail("OCR time budget exhausted", "budget_exceeded")
+    box: dict[str, Any] = {}
+    validate = _make_validator(expected, allow_missing, box) if settings.ocr_validate_response else None
+    started = time.perf_counter()
+    response = await manager.execute(
+        lambda client: client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=[types.Part.from_bytes(data=data, mime_type=mime_type), prompt],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=GeminiOCRResult,
             ),
-            purpose="ocr",
-        )
-    except key_manager.GeminiFailure as exc:
-        logger.error("Gemini OCR request failed: category=%s attempts=%d", exc.category, exc.attempts)
-        raise _wrap(exc, GeminiOCRError) from exc.__cause__
-    api_seconds = time.perf_counter() - api_started
+        ),
+        purpose=purpose,
+        budget=remaining,
+        validate=validate,
+    )
+    api_seconds = time.perf_counter() - started
     parse_started = time.perf_counter()
-    parsed = parse_gemini_json(response.text)
+    parsed = box.get("parsed") or parse_gemini_json(response.text)
     logger.info("Gemini OCR timing: api=%.2fs json_parse=%.3fs response_chars=%d",
                 api_seconds, time.perf_counter() - parse_started, len(response.text or ""))
     return parsed
+
+
+async def _ocr_pages(data: bytes, pages: list[int], deadline: float) -> dict[int, str]:
+    """OCR only `pages` of the PDF in one call; returns {original page number: text}. Must be complete."""
+    parsed = await _run_once(_sub_pdf(data, pages), "application/pdf", OCR_PROMPT, len(pages), False,
+                             deadline, purpose="ocr-recovery")
+    result = ocr_data_from_dict(parsed)
+    return {pages[p.page_number - 1]: p.text for p in result.pages}
+
+
+async def _ocr_pagewise(data: bytes, expected: int, deadline: float) -> dict[str, Any]:
+    """Whole-document output was truncated/unparsable: OCR page by page (bounded concurrency)."""
+    sem = asyncio.Semaphore(_PAGEWISE_CONCURRENCY)
+
+    async def one(number: int) -> tuple[int, str]:
+        async with sem:
+            return number, (await _ocr_pages(data, [number], deadline))[number]
+
+    results = await asyncio.gather(*(one(n) for n in range(1, expected + 1)))
+    return {"pages": [{"page_number": n, "text": t} for n, t in sorted(results)]}
+
+
+def _fail(message: str, category: str) -> GeminiOCRError:
+    err = GeminiOCRError(message)
+    err.category, err.no_retry = category, True  # type: ignore[attr-defined]
+    return err
+
+
+async def extract_text(data: bytes, mime_type: str) -> dict[str, Any]:
+    """Send a document (PDF or image) to Gemini and return the parsed OCR dict.
+
+    The key manager picks keys (randomized) and fails over immediately. Unusable output (empty,
+    truncated, invalid JSON/schema) is retried on another key; a response that only misses pages is
+    completed by re-OCRing just those pages; repeated truncation falls back to page-by-page OCR.
+    Shared outages and malformed requests stop immediately instead of rotating through every key.
+    """
+    settings = get_settings()
+    expected = expected_pages_var.get()
+    if expected is _UNSET:
+        expected = count_pages(data, mime_type)
+    deadline = time.monotonic() + key_manager.get_manager().policy.overall_budget_seconds
+    pagewise_ok = bool(settings.ocr_retry_failed_pages and settings.ocr_validate_response and expected
+                       and expected > 1 and mime_type == "application/pdf")
+    try:
+        try:
+            parsed = await _run_once(data, mime_type, COMBINED_PROMPT, expected, pagewise_ok, deadline)
+        except key_manager.GeminiInvalidResponse as exc:
+            if not (pagewise_ok and exc.category in _PAGEWISE_CATEGORIES):
+                raise
+            logger.warning("[OCR] request=%s whole-document output unusable (%s); OCR page by page",
+                           key_manager.request_id_var.get(), exc.category)
+            return await _ocr_pagewise(data, expected, deadline)
+        if pagewise_ok:
+            pages = ocr_data_from_dict(parsed).pages
+            missing = sorted(set(range(1, expected + 1)) - {p.page_number for p in pages})
+            if missing:
+                logger.warning("[OCR] request=%s response missed %d of %d pages; re-OCR those pages only",
+                               key_manager.request_id_var.get(), len(missing), expected)
+                recovered = await _ocr_pages(data, missing, deadline)
+                merged = {p.page_number: p.text for p in pages} | recovered
+                # Metadata came from an incomplete transcription: drop it so it is re-extracted
+                # from the complete text.
+                return {"pages": [{"page_number": n, "text": merged[n]} for n in sorted(merged)]}
+        return parsed
+    except key_manager.GeminiFailure as exc:
+        logger.error("Gemini OCR request failed: category=%s attempts=%d", exc.category, exc.attempts)
+        raise _wrap(exc, GeminiOCRError) from exc.__cause__
 
 
 METADATA_PROMPT = """You are an information extraction engine working with

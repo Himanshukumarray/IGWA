@@ -146,7 +146,10 @@ def test_pages_returned_out_of_order_are_put_back_in_order(env):
 def test_incomplete_gemini_response_is_rejected_and_groq_covers_it(env, returned):
     g = env({"pages": [{"page_number": n, "text": f"G{n}"} for n in returned], "metadata": META})
     r = ocr(3)
-    assert g.requests == 1 and env.groq["calls"] == 1
+    # A response that merely SKIPS pages gets one targeted re-OCR of the missing page (the stub keeps
+    # returning the same wrong pages, so that fails too and Groq covers the document). Duplicated,
+    # invented or misnumbered pages are not recoverable by page: one request, then Groq.
+    assert g.requests == (2 if returned == [1, 2] else 1) and env.groq["calls"] == 1
     assert r.ocr_provider == "groq" and r.ocr_data.full_text == "GROQ PAGE 1\n\nGROQ PAGE 2\n\nGROQ PAGE 3"
 
 

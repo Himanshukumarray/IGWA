@@ -38,6 +38,9 @@ SCRIPT RULES (the document mixes Hindi in Devanagari and English):
 - Keep the original line breaks where practical, and keep names, numbers and legal sections exactly."""
 
 _PDF_RENDER_ZOOM = 2.0
+# The Groq SDK retries 429/5xx itself (2x, with sleeps) and those retries keep running after the caller
+# gave up. Retries are an application decision (service._call_remote), so the SDK gets none.
+_PAGE_TIMEOUT_SECONDS = 60.0
 _MAX_CONCURRENT_PAGES = 1
 # Groq limits base64 image payloads to 4MB.
 _MAX_IMAGE_BYTES = 3 * 1024 * 1024
@@ -92,7 +95,9 @@ async def _ocr_page(image: bytes, mime_type: str, sem: asyncio.Semaphore) -> str
     settings = get_settings()
     b64 = base64.b64encode(image).decode()
     async with sem:
-        response = await _get_client().chat.completions.create(
+        response = await _get_client().with_options(
+            max_retries=0, timeout=_PAGE_TIMEOUT_SECONDS
+        ).chat.completions.create(
             model=settings.groq_model,
             temperature=0.0,
             messages=[
@@ -110,6 +115,21 @@ async def _ocr_page(image: bytes, mime_type: str, sem: asyncio.Semaphore) -> str
         )
     return (response.choices[0].message.content or "").strip()
 
+async def _gather_or_cancel(coros: list[Any]) -> list[Any]:
+    """asyncio.gather that does not leak: when one page fails (or the caller is cancelled) every
+    sibling still running or queued is cancelled AND awaited. Plain gather() leaves the siblings
+    running after the first error, so a failed request kept calling Groq in the background."""
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    try:
+        return list(await asyncio.gather(*tasks))
+    finally:
+        pending = [t for t in tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
 async def extract_text(data: bytes, mime_type: str) -> dict[str, Any]:
     """OCR a document with Groq; returns the same dict shape as the Gemini client."""
     try:
@@ -117,7 +137,7 @@ async def extract_text(data: bytes, mime_type: str) -> dict[str, Any]:
         if not images:
             raise GroqOCRError("Document has no pages")
         sem = asyncio.Semaphore(_MAX_CONCURRENT_PAGES)
-        texts = await asyncio.gather(*(_ocr_page(img, mime, sem) for img, mime in images))
+        texts = await _gather_or_cancel([_ocr_page(img, mime, sem) for img, mime in images])
     except GroqOCRError:
         raise
     except Exception as exc:
