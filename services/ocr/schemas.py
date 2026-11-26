@@ -154,6 +154,14 @@ class OCRMetadata(BaseModel):
 
     document_narrative: str | None = None
 
+    application_summary: str | None = Field(
+        default=None,
+        description=(
+            "Short factual summary of the whole uploaded document (any document type), in the document's "
+            "main language. Only facts the document states; allegations stay worded as allegations."
+        ),
+    )
+
     investigation_actions_findings: list[str] = Field(
         default_factory=list,
         description=(

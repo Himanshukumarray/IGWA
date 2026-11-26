@@ -174,6 +174,7 @@ _METADATA_JSON_SHAPE = """Return ONLY one JSON object with exactly these keys:
 "complainant_name": string|null, "accused_names": [string], "witness_names": [string],
 "incident_date_time": string|null, "incident_location": string|null,
 "document_narrative": string|null, "investigation_actions_findings": [string],
+"application_summary": string|null,
 "document_class": "FIR"|"APPLICATION"|"OTHER"|"UNCLEAR",
 "fir_date": "YYYY-MM-DD"|null, "incident_date": "YYYY-MM-DD"|null, "title": string|null,
 "case_type": one CASE FIELDS case_type value|null, "case_status": one CASE FIELDS case_status value|null,

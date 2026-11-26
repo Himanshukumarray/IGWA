@@ -223,5 +223,5 @@ def test_http_upload_contract_and_metadata_endpoint(env):
     data = m.json()
     assert set(data) == {"job_id", "metadata_status", "metadata", "metadata_provider", "metadata_error", "isFir"}
     assert data["metadata_status"] == "completed" and data["metadata_provider"] == "gem"
-    assert data["metadata"]["fir_number"] == "FIR 1/2026" and len(data["metadata"]) == 22 and "application" in data["metadata"]
+    assert data["metadata"]["fir_number"] == "FIR 1/2026" and len(data["metadata"]) == 23 and "application" in data["metadata"]
     assert client.get(f"/python/ocr/{body['job_id']}").json()["metadata_status"] == "completed"

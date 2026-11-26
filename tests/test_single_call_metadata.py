@@ -106,7 +106,7 @@ def test_hindi_metadata_values_are_kept_verbatim(setup):
     resp, _ = upload()
     assert resp.metadata.accused_names == [HINDI_NAME]
     assert resp.metadata.police_station == "खैरा थाना" and resp.metadata.incident_location == "धर्मपुर"
-    assert len(resp.metadata.model_dump()) == 22  # 15 fields + application + 6 case-management fields
+    assert len(resp.metadata.model_dump()) == 23  # 15 fields + summary + application + 6 case-management fields
 
 
 def test_invalid_metadata_falls_back_to_background_extraction(setup):

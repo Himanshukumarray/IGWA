@@ -437,3 +437,31 @@ def test_groq_fallback_returns_the_same_case_fields_and_fir_document(env):
     status = service.get_metadata_status(resp.job_id)
     assert status.metadata.case_type is CaseType.CYBER_CRIME and status.metadata.incident_date == "2026-11-17"
     assert status.metadata.fir_document == resp.job_id and status.isFir is True
+
+
+# ---- application_summary ------------------------------------------------------------------------------------------
+
+SUMMARY = "यह प्रथम सूचना रिपोर्ट चोरी की घटना के बारे में है। प्रार्थी राम कुमार ने कार्रवाई का अनुरोध किया है।"
+
+
+def test_both_providers_are_asked_for_the_document_summary():
+    for prompt in (gemini_client.COMBINED_PROMPT, gemini_client.METADATA_PROMPT):
+        for needle in ("APPLICATION SUMMARY", "application_summary", "WHOLE uploaded", "allegations"):
+            assert needle in prompt, needle
+    assert "application_summary" in groq_client._METADATA_JSON_SHAPE
+    assert "application_summary" in GeminiOCRResult.model_json_schema()["$defs"]["OCRMetadata"]["properties"]
+
+
+def test_summary_is_returned_by_the_upload_and_both_get_views(env):
+    env(combined={"pages": PAGES5, "metadata": {**meta("FIR"), "application_summary": SUMMARY},
+                  "application_location": {"found": False}})
+    resp = upload()
+    assert resp.metadata.application_summary == SUMMARY
+    assert service.get_ocr_result(resp.document_id).metadata.application_summary == SUMMARY
+    assert service.get_metadata_status(resp.job_id).metadata.application_summary == SUMMARY
+
+
+def test_summary_comes_from_the_background_request_after_groq_ocr(env):
+    env(combined=RuntimeError("down"), groq_meta={**meta("APPLICATION"), "application_summary": SUMMARY})
+    resp = upload()
+    assert service.get_metadata_status(resp.job_id).metadata.application_summary == SUMMARY

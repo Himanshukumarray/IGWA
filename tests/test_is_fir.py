@@ -130,7 +130,7 @@ def test_public_metadata_fields_and_no_internal_keys(env):
     env(combined={"pages": PAGES, "metadata": meta("FIR")})
     resp, _ = upload()
     dumped = resp.metadata.model_dump()
-    assert len(dumped) == 22 and "application" in dumped and "application_location" not in dumped and "document_class" not in dumped and "isFir" not in dumped
+    assert len(dumped) == 23 and "application" in dumped and "application_location" not in dumped and "document_class" not in dumped and "isFir" not in dumped
 
 
 def test_request_schema_and_prompt_carry_the_classification_rules():

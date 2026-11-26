@@ -373,6 +373,17 @@ CASE FIELDS: also fill these metadata fields (null when the document does not su
   has been assigned to an officer. The mere existence of an FIR, or routine registration wording, is not a
   status: then null.
 
+APPLICATION SUMMARY: also fill "application_summary" in the metadata object: a summary of the WHOLE uploaded
+document, whatever its type (FIR, application, complaint or any other document).
+- 3 to 5 sentences in plain words: what the document is, who it involves, what happened (with dates and places)
+  and what is requested or what action was taken, as far as the document states these.
+- Write it in the document's main language (a mainly Hindi document gets a Hindi summary in Devanagari). Keep
+  names, numbers, dates and legal sections exactly as written.
+- Use only facts stated in the document. Never add facts, opinions or conclusions, and word allegations as
+  allegations, never as proven facts.
+- This is the only field you write in your own words. It never changes the transcribed text or the other fields.
+- If the text is too incomplete or unreadable to summarize, use null.
+
 APPLICATION LOCATION: also report WHERE an application/complaint letter is, as "application_location"
 (location only: never output the application text). Fields: found (bool), start_page, end_page (page
 numbers, null if not found), start_text, end_text (see below). An application is a letter written by a
@@ -409,8 +420,8 @@ COMBINED_PROMPT = (
 ADDITIONALLY, in the same JSON response fill the "metadata" object, extracted ONLY from the text you
 transcribed above (never from outside knowledge). Copy metadata values from the document in their original
 script; do not translate or transliterate them. The metadata object must use exactly the 15 field names
-listed below plus document_class and the fields defined under CASE FIELDS (fir_date, incident_date, title,
-case_type, case_status). Metadata rules:
+listed below plus document_class, application_summary and the fields defined under CASE FIELDS (fir_date,
+incident_date, title, case_type, case_status). Metadata rules:
 
 """
     + _METADATA_RULES

@@ -103,6 +103,8 @@ Otherwise (Groq did the OCR, or the metadata was missing or invalid) the status 
 `GET /python/ocr/{job_id}/metadata` every 2-3 s until it is `completed` or `failed`. `skipped` means no text was
 found. Statuses: `pending`, `processing`, `completed`, `failed`, `skipped`.
 
+- `metadata.application_summary` is a 3-5 sentence summary of the whole uploaded document (any type), in the
+  document's main language, or `null`. It is written by the model, so review it before relying on it.
 - `isFir` is `true` only when the document is confidently an official registered FIR.
 - `metadata.application` is `{found, start_page, end_page, text}`. The model only reports where the attached
   application is; the text is cut from the OCR pages. `found=false` means there is none; `application=null` or
