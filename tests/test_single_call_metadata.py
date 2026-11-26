@@ -60,7 +60,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(service, "get_settings", lambda: cfg)
     service.ocr_results.clear()
 
-    async def groq_must_not_run(data, mime):
+    async def groq_must_not_run(data, mime, done=None):
         raise AssertionError("Groq must not be called")
 
     monkeypatch.setattr(groq_client, "extract_text", groq_must_not_run)
@@ -137,7 +137,7 @@ def test_groq_ocr_has_no_same_call_metadata_so_background_runs(setup, monkeypatc
     g = setup({})
     monkeypatch.setattr(km, "_manager", km.GeminiKeyManager([]))  # no Gemini credentials at all
 
-    async def groq(data, mime):
+    async def groq(data, mime, done=None):
         return {"pages": PAGES, "full_text": PAGES[0]["text"]}
 
     monkeypatch.setattr(groq_client, "extract_text", groq)

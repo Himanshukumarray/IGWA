@@ -63,7 +63,7 @@ def env(monkeypatch):
     service.ocr_results.clear()
     state = {"groq_ocr": 0}
 
-    async def groq_ocr(data, mime):
+    async def groq_ocr(data, mime, done=None):
         state["groq_ocr"] += 1
         return {"pages": PAGES, "full_text": PAGES[0]["text"]}
 
@@ -185,8 +185,13 @@ def test_background_gemini_text_only_fallback_classifies_and_updates_every_endpo
     assert service.get_ocr_result(resp.job_id).isFir is True
 
 
-def test_groq_ocr_then_background_metadata_classifies_application_as_false(env):
+def test_groq_ocr_then_background_metadata_classifies_application_as_false(env, monkeypatch):
     env(combined=None, text_only=meta("APPLICATION"), keys=())  # no Gemini key: Groq does the OCR
+
+    async def groq_meta(text):  # hermetic: this test used to reach the REAL Groq API whenever a key was configured
+        return OCRMetadata(**meta("APPLICATION"))
+
+    monkeypatch.setattr(groq_client, "extract_metadata", groq_meta)
     resp, tasks = upload()
     assert resp.ocr_provider == "groq" and resp.isFir is False and env.state["groq_ocr"] == 1
     asyncio.run(tasks())

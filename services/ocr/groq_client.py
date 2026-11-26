@@ -39,7 +39,7 @@ SCRIPT RULES (the document mixes Hindi in Devanagari and English):
 
 _PDF_RENDER_ZOOM = 2.0
 # The Groq SDK retries 429/5xx itself (2x, with sleeps) and those retries keep running after the caller
-# gave up. Retries are an application decision (service._call_remote), so the SDK gets none.
+# gave up. Retries are an application decision (service._call_groq), so the SDK gets none.
 _PAGE_TIMEOUT_SECONDS = 60.0
 _MAX_CONCURRENT_PAGES = 1
 # Groq limits base64 image payloads to 4MB.
@@ -130,20 +130,35 @@ async def _gather_or_cancel(coros: list[Any]) -> list[Any]:
             await asyncio.gather(*pending, return_exceptions=True)
 
 
-async def extract_text(data: bytes, mime_type: str) -> dict[str, Any]:
-    """OCR a document with Groq; returns the same dict shape as the Gemini client."""
+async def extract_text(data: bytes, mime_type: str, done: dict[int, str] | None = None) -> dict[str, Any]:
+    """OCR a document with Groq; returns the same dict shape as the Gemini client.
+
+    `done` (page number -> text) is the caller's page registry: pages already in it are NOT sent again, and every
+    page that succeeds is written into it immediately. When a later page fails (e.g. HTTP 429) the exception
+    carries the same dict as `.partial`, so no successful page is ever discarded and a retry only does the rest."""
+    done = {} if done is None else done
     try:
         images = await asyncio.to_thread(_prepare_images, data, mime_type)
         if not images:
             raise GroqOCRError("Document has no pages")
         sem = asyncio.Semaphore(_MAX_CONCURRENT_PAGES)
-        texts = await _gather_or_cancel([_ocr_page(img, mime, sem) for img, mime in images])
-    except GroqOCRError:
+
+        async def one(number: int, image: bytes, mime: str) -> None:
+            done[number] = await _ocr_page(image, mime, sem)
+
+        await _gather_or_cancel([one(n, img, mime) for n, (img, mime) in enumerate(images, start=1)
+                                 if n not in done])
+    except GroqOCRError as exc:
+        exc.partial = done  # type: ignore[attr-defined]
         raise
     except Exception as exc:
-        logger.error("Groq request failed: %s", type(exc).__name__)
-        raise GroqOCRError("Groq request failed") from exc
+        _status, category, _ = describe_provider_error(exc)
+        logger.error("Groq request failed: category=%s preserved_pages=%d", category, len(done))
+        err = GroqOCRError("Groq request failed")
+        err.category, err.partial = category, done  # type: ignore[attr-defined]
+        raise err from exc
 
+    texts = [done[i] for i in range(1, len(images) + 1)]
     pages = [{"page_number": i, "text": t} for i, t in enumerate(texts, start=1)]
     return {"pages": pages, "full_text": "\n\n".join(texts)}
 

@@ -1,17 +1,15 @@
+"""Upload -> OCR (Gemini, then Groq) -> stored record; metadata in the same call or in the background."""
 import asyncio
-import contextvars
 import logging
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
-import fitz
 from fastapi import BackgroundTasks, HTTPException, UploadFile
 from pydantic import ValidationError
 
 from config.settings import Settings, get_settings
-from services.ocr import batch_ocr, gemini_client, gemini_key_manager, groq_client, utils
+from services.ocr import gemini_client, gemini_key_manager, groq_client, utils
 from services.ocr.application import attach_application, build_marked_text
 from services.ocr.gemini_client import GeminiMetadataError, GeminiOCRError
 from services.ocr.groq_client import GroqMetadataError, GroqOCRError
@@ -42,25 +40,19 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# True while the current request was OCRed in several batches (no same-call metadata exists then).
-batch_mode_var: contextvars.ContextVar[bool] = contextvars.ContextVar("ocr_batch_mode", default=False)
-
 _OCR_FAILED = "OCR provider failed to process the document"
 _REMOTE_ERRORS = (GeminiOCRError, GroqOCRError, ValidationError, ValueError, asyncio.TimeoutError)
 _MAX_RETRY_AFTER_SECONDS = 10.0
 
-# ---- remote providers (Gemini -> Groq) ---------------------------------------------------
+# ---- OCR providers (Gemini -> Groq) ------------------------------------------------------
 
 
 def _retry_delay(exc: BaseException, attempt: int) -> float | None:
-    """Seconds to wait before retrying a provider error, or None when retrying is pointless.
+    """Seconds to wait before retrying a Groq error, or None when retrying is pointless.
 
-    Billing/auth/bad-request errors (e.g. Gemini 402) are never retried. Rate limits are retried
-    only when the provider's Retry-After is short; 5xx/timeouts/connection errors use a small
-    exponential backoff.
+    Billing/auth/bad-request errors are never retried. Rate limits are retried only when the
+    provider's Retry-After is short; 5xx/timeouts/connection errors use a small exponential backoff.
     """
-    if getattr(exc, "no_retry", False):
-        return None  # the Gemini key manager already did bounded, ordered failover
     cause = exc.__cause__ or exc
     _status, category, _ = gemini_client.describe_provider_error(cause)
     if category == "rate_limit":
@@ -85,24 +77,90 @@ def _error_category(exc: BaseException) -> str:
     return gemini_client.describe_provider_error(exc.__cause__ or exc)[1]
 
 
-async def _call_remote(extract: Any, payload: bytes, mime: str, retries: int, s: Settings,
-                       timeout: float | None = None) -> dict:
-    """One provider OCR call with a timeout and bounded, classified retries."""
-    timeout = s.ocr_remote_timeout_seconds if timeout is None else min(timeout, s.ocr_remote_timeout_seconds)
+async def _call_gemini(payload: bytes, mime: str, timeout: float, s: Settings) -> dict:
+    """One Gemini OCR request. Retries and key failover happen inside the key manager."""
+    return await asyncio.wait_for(gemini_client.extract_text(payload, mime), timeout)
+
+
+async def _call_groq(payload: bytes, mime: str, timeout: float, s: Settings) -> dict:
+    """Groq OCR with bounded retries. Pages already obtained are kept in `done` and never requested
+    again, so a retry after an HTTP 429 only sends the pages that are still missing. No retry starts
+    when the remaining time could not finish it."""
+    done: dict[int, str] = {}
+    started = time.monotonic()
+    retries = s.ocr_groq_max_retries
     for attempt in range(retries + 1):
         try:
-            return await asyncio.wait_for(extract(payload, mime), timeout)
-        except (GeminiOCRError, GroqOCRError) as exc:
+            return await asyncio.wait_for(
+                groq_client.extract_text(payload, mime, done=done),
+                max(timeout - (time.monotonic() - started), 0.1))
+        except GroqOCRError as exc:
             delay = _retry_delay(exc, attempt) if attempt < retries else None
-            if delay is None:
+            if delay is None or timeout - (time.monotonic() - started) < delay + 5.0:
                 raise
-            logger.warning("Provider OCR retry in %.1fs: category=%s", delay, _error_category(exc))
+            logger.warning("Groq OCR retry in %.1fs: category=%s", delay, _error_category(exc))
             await _sleep(delay)
     raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)  # separate seam so tests can skip real backoff delays
+
+
+def _verify_all_pages(data: OCRData, expected: int | None) -> None:
+    """Reject a response that skipped, duplicated or invented pages (it falls back to Groq)."""
+    if expected is not None and [p.page_number for p in data.pages] != list(range(1, expected + 1)):
+        raise ValueError("provider did not return every page exactly once")
+
+
+async def _run_ocr(
+    payload: bytes, mime: str, document_id: str, s: Settings
+) -> tuple[OCRData, str, str, OCRMetadata | None]:
+    """Whole document to Gemini, then Groq. Returns (data, model, provider, metadata).
+
+    Gemini returns the metadata in the same response; Groq OCR does not, so metadata is None there.
+    """
+    providers = []
+    if s.ocr_enable_gemini_fallback:
+        providers.append(("gemini", _call_gemini, s.gemini_model))
+    if s.ocr_enable_groq_fallback:
+        providers.append(("groq", _call_groq, s.groq_model))
+
+    failures: list[str] = []
+    deadline = time.monotonic() + s.ocr_overall_deadline_seconds  # Gemini + Groq share one budget
+    expected = gemini_client.count_pages(payload, mime)  # None: unreadable PDF, page check skipped
+    for name, call, model in providers:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            failures.append(f"{name}=deadline_exceeded")
+            logger.warning("[OCR] request=%s overall deadline reached before %s", document_id, name)
+            break
+        if name == "groq" and failures:
+            logger.warning("job=%s Groq fallback used (Gemini unavailable)", document_id)
+        try:
+            logger.info("%s OCR started: document_id=%s pages=%s", name, document_id, expected)
+            call_started = time.perf_counter()
+            raw = await call(payload, mime, remaining, s)
+            call_seconds = time.perf_counter() - call_started
+            timings: dict[str, float] = {}
+            data = ocr_data_from_dict(raw, timings)
+            _verify_all_pages(data, expected)
+            metadata = metadata_from_dict(raw) if name == "gemini" else None
+            logger.info(
+                "job=%s OCR timing: provider=%s call=%.2fs parse_validate=%.3fs full_text_join=%.4fs "
+                "pages=%d chars=%d metadata_in_same_call=%s",
+                document_id, name, call_seconds, timings["parse"], timings["full_text"],
+                len(data.pages), len(data.full_text), metadata is not None)
+            return data, model, name, metadata
+        except _REMOTE_ERRORS as exc:
+            failures.append(f"{name}={_error_category(exc)}")
+            logger.warning("%s OCR failed: document_id=%s reason=%s", name, document_id, failures[-1])
+    logger.error("[OCR] request=%s Status: FAILED reasons=%s", document_id,
+                 " ".join(failures) or "no_provider_enabled")
+    raise HTTPException(status_code=502, detail=_OCR_FAILED)
+
+
+# ---- metadata -----------------------------------------------------------------------------
 
 
 def _is_fir(metadata: OCRMetadata | None, job_id: str) -> bool:
@@ -132,115 +190,35 @@ def _finalize_metadata(metadata: OCRMetadata, pages: list[OCRPage], job_id: str)
     return metadata.model_copy(update={"fir_document": job_id if is_fir else None}), is_fir
 
 
-def _note_groq_fallback(job: str) -> None:
-    """Metric + log: Groq is being used because Gemini could not serve the request."""
-    gemini_key_manager.get_manager().record_groq_fallback()
-    logger.warning("job=%s Groq fallback used (Gemini unavailable)", job)
+async def extract_metadata(
+    job_id: str, ocr_text: str
+) -> tuple[OCRMetadata | None, str | None]:
+    """Gemini metadata extraction with Groq fallback. Returns (metadata, model).
 
-
-def _remote_providers(s: Settings) -> list[tuple[str, Any, str, int]]:
-    """Enabled remote OCR providers in priority order: (name, extract_fn, model, retries)."""
-    providers = []
-    if s.ocr_enable_gemini_fallback:
-        providers.append(("gemini", gemini_client.extract_text, s.gemini_model, s.ocr_gemini_max_retries))
-    if s.ocr_enable_groq_fallback:
-        providers.append(("groq", groq_client.extract_text, s.groq_model, s.ocr_groq_max_retries))
-    return providers
-
-
-def _expected_page_count(payload: bytes, mime: str) -> int | None:
-    """Pages in the upload (None if it cannot be counted, e.g. a corrupt PDF: check is skipped)."""
-    if mime != "application/pdf":
-        return 1
-    try:
-        with fitz.open(stream=payload, filetype="pdf") as doc:
-            return doc.page_count or None
-    except Exception:
-        return None
-
-
-def _verify_all_pages(data: OCRData, expected: int | None) -> None:
-    """Reject a response that skipped, duplicated or invented pages (it falls back to Groq)."""
-    if expected is not None and [p.page_number for p in data.pages] != list(range(1, expected + 1)):
-        raise ValueError("provider did not return every page exactly once")
-
-
-def _use_batches(payload: bytes, mime: str, expected: int | None, s: Settings) -> bool:
-    """Batch OCR only for a PDF that needs more than one batch; everything else keeps the single-request
-    path (which also returns the metadata in the same call)."""
-    if not (s.ocr_batch_processing_enabled and s.ocr_enable_gemini_fallback and mime == "application/pdf"
-            and expected and expected > 1):
-        return False
-    size = batch_ocr.effective_batch_size(expected, len(payload), s)
-    return len(batch_ocr.plan_batches(expected, size)) > 1
-
-
-async def _remote_batches(
-    payload: bytes, expected: int, document_id: str, s: Settings, deadline: float
-) -> tuple[OCRData, str, str, OCRMetadata | None]:
-    """Parallel batch OCR (Gemini keys, Groq per failed batch). Metadata is extracted after the merge."""
-    groq_call = None
-    if s.ocr_enable_groq_fallback:
-        async def groq_call(batch_pdf: bytes, timeout: float) -> dict:
-            return await _call_remote(groq_client.extract_text, batch_pdf, "application/pdf",
-                                      s.ocr_groq_max_retries, s, timeout)
-    reserve = min(s.ocr_metadata_reserve_seconds, 0.25 * s.ocr_overall_deadline_seconds)
-    run = batch_ocr.BatchRun(
-        payload, expected, s, manager=gemini_key_manager.get_manager(), deadline=deadline - reserve,
-        groq_call=groq_call, on_groq_fallback=lambda: _note_groq_fallback(document_id))
-    batch_mode_var.set(True)
-    try:
-        result = await run.run()
-    except batch_ocr.BatchOCRError as exc:
-        logger.error("[OCR] request=%s Status: FAILED failed_pages=%s (document not stored; client may re-upload)",
-                     document_id, exc.failed)
-        raise HTTPException(status_code=502, detail=_OCR_FAILED) from exc
-    model = s.groq_model if result.provider == "groq" else s.gemini_model
-    return result.data, model, result.provider, None
-
-
-async def _remote_whole_document(
-    payload: bytes, mime: str, document_id: str, s: Settings
-) -> tuple[OCRData, str, str, OCRMetadata | None]:
-    """Whole document to Gemini, then Groq. Returns (data, model, provider, metadata).
-
-    Gemini returns the metadata in the same response; Groq OCR does not, so metadata is None there.
+    metadata is None only when both providers failed. Each client validates its output
+    against OCRMetadata; invalid or truncated output raises and triggers the fallback.
     """
-    failures: list[str] = []
-    deadline = time.monotonic() + s.ocr_overall_deadline_seconds  # Gemini + Groq share one budget
-    gemini_client.expected_pages_var.set(_expected_page_count(payload, mime))  # counted once, shared
-    expected = gemini_client.expected_pages_var.get()
-    if _use_batches(payload, mime, expected, s):
-        return await _remote_batches(payload, expected, document_id, s, deadline)
-    for name, extract, model, retries in _remote_providers(s):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            failures.append(f"{name}=deadline_exceeded")
-            logger.warning("[OCR] request=%s overall deadline reached before %s", document_id, name)
-            break
-        if name == "groq" and failures:
-            _note_groq_fallback(document_id)
-        try:
-            logger.info("%s OCR started: document_id=%s", name, document_id)
-            call_started = time.perf_counter()
-            raw = await _call_remote(extract, payload, mime, retries, s, remaining)
-            call_seconds = time.perf_counter() - call_started
-            timings: dict[str, float] = {}
-            data = ocr_data_from_dict(raw, timings)
-            _verify_all_pages(data, gemini_client.expected_pages_var.get())
-            metadata = metadata_from_dict(raw) if name == "gemini" else None
-            logger.info(
-                "job=%s OCR timing: provider=%s call=%.2fs parse_validate=%.3fs full_text_join=%.4fs "
-                "pages=%d chars=%d metadata_in_same_call=%s",
-                document_id, name, call_seconds, timings["parse"], timings["full_text"],
-                len(data.pages), len(data.full_text), metadata is not None)
-            return data, model, name, metadata
-        except _REMOTE_ERRORS as exc:
-            failures.append(f"{name}={_error_category(exc)}")
-            logger.warning("%s OCR failed: document_id=%s reason=%s", name, document_id, failures[-1])
-    logger.error("[OCR] request=%s Status: FAILED reasons=%s (document not stored; client may re-upload)",
-                 document_id, " ".join(failures) or "no_provider_enabled")
-    raise HTTPException(status_code=502, detail=_OCR_FAILED)
+    settings = get_settings()
+    timeout = settings.metadata_timeout_seconds
+    try:
+        logger.info("job=%s Gemini metadata extraction started", job_id)
+        metadata = await asyncio.wait_for(gemini_client.extract_metadata(ocr_text), timeout)
+        return metadata, settings.gemini_model
+    except (GeminiMetadataError, ValidationError, asyncio.TimeoutError) as gemini_exc:
+        gemini_reason = type(gemini_exc).__name__
+        logger.warning("job=%s Gemini failed (%s); Groq fallback started", job_id, gemini_reason)
+    try:
+        metadata = await asyncio.wait_for(groq_client.extract_metadata(ocr_text), timeout)
+        return metadata, settings.groq_model
+    except (GroqMetadataError, ValidationError, asyncio.TimeoutError) as groq_exc:
+        logger.error(
+            "job=%s Metadata extraction failed gemini=%s groq=%s",
+            job_id, gemini_reason, type(groq_exc).__name__,
+        )
+        return None, None
+
+
+# ---- requests -----------------------------------------------------------------------------
 
 
 async def process_ocr(file: UploadFile) -> OCRResultResponse:
@@ -253,37 +231,18 @@ async def process_ocr(file: UploadFile) -> OCRResultResponse:
 
     document_id = str(uuid.uuid4())
     gemini_key_manager.request_id_var.set(document_id)  # correlates every [OCR] log line of this request
-    request_started = time.perf_counter()
+    started = time.perf_counter()
     logger.info("OCR upload received: document_id=%s filename=%s", document_id, filename)
-    logger.info("[OCR] request=%s PDF received: %s", document_id, filename)
 
-    payload, payload_mime = utils.preprocess_document(data, mime_type)
-
-    # Gemini (ordered key failover) -> Groq, whole document.
-    ocr_data, ocr_model, ocr_provider, metadata = await _remote_whole_document(
-        payload, payload_mime, document_id, settings
-    )
+    ocr_data, ocr_model, ocr_provider, metadata = await _run_ocr(data, mime_type, document_id, settings)
 
     now = _now()
     has_text = bool(ocr_data.full_text.strip())
-    metadata_model = ocr_model
-    if metadata is None and has_text and batch_mode_var.get() and settings.ocr_metadata_after_merge:
-        # Multi-batch document: the metadata comes from the merged text, once, still inside this request
-        # (as with the single-call path). If it cannot be had in time it runs in the background as before.
-        left = settings.ocr_overall_deadline_seconds - (time.perf_counter() - request_started)
-        limit = min(settings.metadata_timeout_seconds, max(left, settings.ocr_metadata_reserve_seconds))
-        try:
-            metadata, found_model = await asyncio.wait_for(
-                extract_metadata(document_id, build_marked_text(ocr_data.pages)), limit)
-            metadata_model = found_model or ocr_model
-        except asyncio.TimeoutError:
-            logger.warning("job=%s Metadata after merge timed out; falling back to background", document_id)
-            metadata = None
     if has_text and metadata is not None:
         # Same-call location -> application text cut from pages[] in Python (no extra request).
         metadata, is_fir = _finalize_metadata(metadata, ocr_data.pages, document_id)
         metadata_state = dict(
-            metadata=metadata, metadata_model=metadata_model, metadata_status=MetadataStatus.COMPLETED,
+            metadata=metadata, metadata_model=ocr_model, metadata_status=MetadataStatus.COMPLETED,
             isFir=is_fir,
         )
     else:  # no usable same-call metadata: extract in the background from the OCR text
@@ -304,17 +263,15 @@ async def process_ocr(file: UploadFile) -> OCRResultResponse:
         **metadata_state,
     )
     ocr_results[document_id] = record
-    logger.info("job=%s OCR completed provider=%s", document_id, ocr_provider)
-    logger.info("[OCR] request=%s Provider: %s Validation: passed Fallback used: %s Total processing time: %.2fs "
-                "Status: SUCCESS", document_id, ocr_provider, ocr_provider != "gemini",
-                time.perf_counter() - request_started)
+    logger.info("[OCR] request=%s Provider: %s Total processing time: %.2fs Status: SUCCESS",
+                document_id, ocr_provider, time.perf_counter() - started)
     return record
 
 
 async def process_upload(
     file: UploadFile, background_tasks: BackgroundTasks
 ) -> OCRUploadResponse:
-    """Run OCR, store the job, schedule metadata extraction and return immediately."""
+    """Run OCR, store the job, schedule metadata extraction if needed and return immediately."""
     request_started = time.perf_counter()
     record = await process_ocr(file)
     job_id = record.document_id
@@ -336,35 +293,6 @@ async def process_upload(
         message=message,
         **record.model_dump(exclude={"success", "created_at", "updated_at"}),
     )
-
-
-async def extract_metadata(
-    job_id: str, ocr_text: str
-) -> tuple[OCRMetadata | None, str | None]:
-    """Gemini metadata extraction with Groq fallback. Returns (metadata, model).
-
-    metadata is None only when both providers failed. Each client validates its output
-    against OCRMetadata; invalid or truncated output raises and triggers the fallback.
-    """
-    settings = get_settings()
-    timeout = settings.metadata_timeout_seconds
-    try:
-        logger.info("job=%s Gemini extraction started", job_id)
-        metadata = await asyncio.wait_for(gemini_client.extract_metadata(ocr_text), timeout)
-        return metadata, settings.gemini_model
-    except (GeminiMetadataError, ValidationError, asyncio.TimeoutError) as gemini_exc:
-        gemini_reason = type(gemini_exc).__name__
-        logger.warning("job=%s Gemini failed (%s); Groq fallback started", job_id, gemini_reason)
-    _note_groq_fallback(job_id)
-    try:
-        metadata = await asyncio.wait_for(groq_client.extract_metadata(ocr_text), timeout)
-        return metadata, settings.groq_model
-    except (GroqMetadataError, ValidationError, asyncio.TimeoutError) as groq_exc:
-        logger.error(
-            "job=%s Metadata extraction failed gemini=%s groq=%s",
-            job_id, gemini_reason, type(groq_exc).__name__,
-        )
-        return None, None
 
 
 def _update_job(job_id: str, **changes: object) -> None:

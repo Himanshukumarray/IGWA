@@ -76,31 +76,6 @@ class GeminiSharedFailure(GeminiFailure):
     """Network/DNS/timeout/overload: rotating keys would not help."""
 
 
-class AttemptError(Exception):
-    """One batch attempt on one key failed. `action` tells the scheduler what to do next:
-    next_key (try another key), split (the input is too heavy: make it smaller), request (the request
-    itself is rejected: another key would fail too), budget (the application ran out of time; nobody
-    is to blame)."""
-
-    def __init__(self, category: str, action: str, *, retry_after: float | None = None,
-                 rate_limited: bool = False, shared: bool = False, slot: int | None = None):
-        super().__init__(category)
-        self.category, self.action, self.retry_after = category, action, retry_after
-        self.rate_limited, self.shared, self.slot = rate_limited, shared, slot
-
-
-def allocation(healthy: int, max_parallel: int, reserved: int) -> tuple[int, int]:
-    """(active batch workers, standby keys) for `healthy` usable keys. 6->4/2, 5->3/2, 4->2/2, 3->2/1,
-    2->1/1, 1->1/0, 0->0/0 with the defaults (max_parallel=4, reserved=2). Standby is only a preference:
-    recovery may use any free key and fresh work never deadlocks waiting for standby."""
-    if healthy <= 0:
-        return 0, 0
-    if healthy == 1:
-        return 1, 0
-    standby = min(reserved, reserved if healthy - reserved >= 2 else 1)
-    return max(1, min(max_parallel, healthy - standby)), standby
-
-
 class GeminiRequestFailure(GeminiFailure):
     """Malformed request, unsupported model, payload too large...: same for every key."""
 
@@ -206,12 +181,13 @@ class Policy:
     failover_delay_seconds: float = 0.0
     shared_failover_max_keys: int = 1  # 1 = legacy: a 5xx/timeout stops instead of rotating
     max_invalid_response_attempts: int = 2
-    max_concurrent_per_key: int = 0  # 0 = unlimited; soft in execute(), strict for reserve()/acquire()
-    global_max_concurrent: int = 0  # strict cap on simultaneously reserved/active calls, 0 = unlimited
     rate_limit_cooldown_seconds: float = 60.0
     quota_cooldown_seconds: float = 3600.0
     billing_cooldown_seconds: float = 3600.0
     forbidden_cooldown_seconds: float = 3600.0
+    # An execute() attempt is only started when at least this much budget is left: a call that cannot finish is
+    # doomed, burns quota, and would otherwise be blamed on the provider.
+    min_attempt_seconds: float = 0.5
 
     @classmethod
     def from_settings(cls, s: Settings) -> "Policy":
@@ -224,12 +200,11 @@ class Policy:
             failover_delay_seconds=s.gemini_failover_delay_seconds,
             shared_failover_max_keys=s.gemini_shared_failover_max_keys,
             max_invalid_response_attempts=s.gemini_max_invalid_response_attempts,
-            max_concurrent_per_key=s.gemini_max_concurrent_per_key,
-            global_max_concurrent=s.ocr_global_max_concurrent_batches,
             rate_limit_cooldown_seconds=s.gemini_rate_limit_cooldown_seconds,
             quota_cooldown_seconds=s.gemini_quota_cooldown_seconds,
             billing_cooldown_seconds=s.gemini_billing_cooldown_seconds,
             forbidden_cooldown_seconds=s.gemini_forbidden_cooldown_seconds,
+            min_attempt_seconds=s.gemini_min_attempt_seconds,
         )
 
 
@@ -259,7 +234,6 @@ class _Slot:
     last_failure_at: float | None = None
     last_error: str | None = None
     response_seconds: float = 0.0  # summed over successes
-    active: int = 0
 
     @property
     def label(self) -> str:
@@ -323,11 +297,10 @@ class GeminiKeyManager:
         self._clock = clock
         self._rng = rng or random.Random()
         self._lock = threading.Lock()  # never held across an await
-        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._shared_block_until = 0.0
         self._shared_block_category = "network"
         self.metrics: dict[str, Any] = {
-            "attempts": 0, "successes": 0, "failures": {}, "success_by_slot": {}, "groq_fallbacks": 0,
+            "attempts": 0, "successes": 0, "failures": {}, "success_by_slot": {},
         }
 
     # -- state ---------------------------------------------------------------------------------
@@ -363,13 +336,8 @@ class GeminiKeyManager:
                     "last_failure_at": s.last_failure_at,
                     "last_error": s.last_error,
                     "average_response_seconds": round(s.response_seconds / s.successes, 3) if s.successes else None,
-                    "active_requests": s.active,
                 })
             return out
-
-    def record_groq_fallback(self) -> None:
-        with self._lock:
-            self.metrics["groq_fallbacks"] += 1
 
     def reset(self) -> None:
         with self._lock:
@@ -377,179 +345,24 @@ class GeminiKeyManager:
                 s.disabled_reason, s.cooldown_until, s.reason = None, 0.0, None
             self._shared_block_until = 0.0
 
-    def reload(self, keys: list[str], policy: Policy | None = None) -> None:
-        """Adopt a new key list (keys added/removed/reordered in the environment). Keys that are
-        still present keep their health state and client; new keys start healthy."""
-        with self._lock:
-            old = {s.key: s for s in self._slots}
-            slots = []
-            for i, key in enumerate(keys, start=1):
-                slot = old.get(key) or _Slot(i, key)
-                slot.number = i
-                slots.append(slot)
-            self._slots = slots
-            if policy is not None:
-                self.policy = policy
-                for s in slots:
-                    s.client = None  # timeout settings may have changed
-
     def _client(self, slot: _Slot) -> Any:
         with self._lock:
             if slot.client is None:
                 slot.client = self._client_factory(slot.key, self.policy)
             return slot.client
 
-    def _plan(self) -> tuple[list[_Slot], int]:
-        """Eligible keys in the order this request will try them, plus the count skipped.
-
-        random: a fresh shuffle per request, so each key appears at most once (no replacement) and
-        a failed key is never picked again in the same request. Keys at their concurrency cap move
-        to the back (stable sort) but stay usable, so load spreads without ever blocking.
-        """
+    def _next_slot(self, tried: set[int]) -> "_Slot | None":
+        """An eligible key this request has not tried yet (random or configured order), counted as an
+        attempt. None when every key was tried, is cooling down or is disabled."""
         now = self._clock()
         with self._lock:
-            eligible = [s for s in self._slots if s.available(now)]
-            skipped = len(self._slots) - len(eligible)
-            if self.policy.selection == "random":
-                self._rng.shuffle(eligible)
-            cap = self.policy.max_concurrent_per_key
-            if cap > 0:
-                eligible.sort(key=lambda s: s.active >= cap)
-            return eligible, skipped
-
-    def _begin(self, slot: _Slot) -> None:
-        with self._lock:
-            slot.active += 1
-            slot.total += 1
-            self.metrics["attempts"] += 1
-
-    def _end(self, slot: _Slot) -> None:
-        with self._lock:
-            slot.active = max(0, slot.active - 1)
-            waiters = list(self._waiters)
-        for loop, event in waiters:  # a key was freed: let waiting batches re-check (FIFO order)
-            try:
-                loop.call_soon_threadsafe(event.set)
-            except RuntimeError:  # that loop is already closed
-                pass
-
-    # -- strict reservations (parallel batch OCR) -------------------------------------------------
-    def healthy_count(self) -> int:
-        """Keys that are not disabled and not cooling down (busy or not)."""
-        now = self._clock()
-        with self._lock:
-            return sum(s.available(now) for s in self._slots)
-
-    def reserve(self, *, exclude: "frozenset[int] | set[int]" = frozenset()) -> "tuple[_Slot | None, str]":
-        """Try to reserve one key for one call. Returns (slot, "ok") or (None, "busy"|"none").
-
-        Strict: a key already at Policy.max_concurrent_per_key active calls is never returned, and the
-        process-wide total never exceeds Policy.global_max_concurrent. "busy" = candidates exist but are
-        occupied: wait and retry. "none" = no eligible key at all (all excluded, cooling down or
-        disabled): waiting will not help. Standby capacity is not a pool-wide hold (that would starve a
-        second document): a document runs `allocation()` workers, so (healthy - workers) keys stay free for
-        its own recovery, and recovery work is queued ahead of fresh work.
-        """
-        now = self._clock()
-        with self._lock:
-            candidates = [s for s in self._slots if s.available(now) and s.number not in exclude]
+            candidates = [s for s in self._slots if s.available(now) and s.number not in tried]
             if not candidates:
-                return None, "none"
-            cap = self.policy.max_concurrent_per_key
-            total_active = sum(s.active for s in self._slots)
-            global_cap = self.policy.global_max_concurrent
-            if global_cap and total_active >= global_cap:
-                return None, "busy"
-            free = [s for s in candidates if cap == 0 or s.active < cap]
-            if not free:
-                return None, "busy"
-            slot = self._rng.choice(free) if self.policy.selection == "random" else free[0]
-            slot.active += 1
+                return None
+            slot = self._rng.choice(candidates) if self.policy.selection == "random" else candidates[0]
             slot.total += 1
             self.metrics["attempts"] += 1
-            return slot, "ok"
-
-    def release(self, slot: _Slot) -> None:
-        """Give a reserved key back (after success, failure or cancellation)."""
-        self._end(slot)
-
-    async def acquire(self, *, exclude: "frozenset[int] | set[int]" = frozenset(),
-                      deadline: float | None = None) -> "_Slot | None":
-        """reserve() that waits (woken by release(), re-checked at least every second) while keys are
-        merely busy. None = no eligible key, or the deadline passed."""
-        event = asyncio.Event()
-        entry = (asyncio.get_running_loop(), event)
-        with self._lock:
-            self._waiters.append(entry)
-        try:
-            while True:
-                event.clear()
-                slot, status = self.reserve(exclude=exclude)
-                if status == "ok":
-                    return slot
-                if status == "none":
-                    return None
-                wait = 1.0 if deadline is None else min(1.0, deadline - self._clock())
-                if wait <= 0:
-                    return None
-                try:
-                    await asyncio.wait_for(event.wait(), wait)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            with self._lock:
-                if entry in self._waiters:
-                    self._waiters.remove(entry)
-
-    async def attempt(self, slot: _Slot, call: Callable[[Any], Awaitable[T]], *, timeout: float,
-                      validate: Callable[[T], None] | None = None, budget_limited: bool = False,
-                      purpose: str = "ocr") -> T:
-        """ONE call on an already reserved key (the caller releases it). No key rotation here: the
-        failure is classified into an AttemptError and the batch scheduler decides what happens next.
-
-        Health policy: invalid key -> disabled; billing/403/429 -> cooldown; network/5xx -> a short
-        bench (no circuit breaker: one flaky batch is not a provider outage); a processing TIMEOUT or an
-        unusable response never penalizes the key, and a timeout caused by the application's own
-        remaining budget (budget_limited) is not even counted as a failure.
-        """
-        rid = request_id_var.get()
-        started = self._clock()
-        try:
-            result = await asyncio.wait_for(call(self._client(slot)), timeout)
-            if validate is not None:
-                validate(result)
-        except asyncio.CancelledError:
-            raise
-        except InvalidResponse as exc:
-            self._record_failure(slot, exc.category)
-            action = "split" if exc.category == "truncated" else "next_key"
-            raise AttemptError(exc.category, action, slot=slot.number) from exc
-        except (asyncio.TimeoutError, TimeoutError) as exc:
-            if budget_limited:
-                raise AttemptError("budget_timeout", "budget", slot=slot.number) from exc
-            self._record_failure(slot, "timeout")
-            raise AttemptError("timeout", "split", slot=slot.number) from exc
-        except Exception as exc:
-            failure = classify_error(exc)
-            self._record_failure(slot, failure.category)
-            if failure.kind in _KEY_KINDS:
-                logger.warning("Gemini credential slot %d: %s", slot.number, self._penalize(slot, failure))
-                raise AttemptError(failure.category, "next_key", retry_after=failure.retry_after,
-                                   rate_limited=failure.kind in (Kind.RATE_LIMIT, Kind.QUOTA),
-                                   slot=slot.number) from exc
-            if failure.kind == Kind.SHARED:
-                if failure.category == "timeout":  # provider-side 408/504: the work was too slow, not the key
-                    raise AttemptError("timeout", "split", slot=slot.number) from exc
-                self._bench(slot, failure)
-                raise AttemptError(failure.category, "next_key", shared=True, slot=slot.number) from exc
-            logger.error("Gemini credential slot %d: %s (request error) %s", slot.number, failure.category,
-                         self.redact(" ".join(str(exc).split())[:160]))
-            raise AttemptError(failure.category, "request", slot=slot.number) from exc
-        duration = self._clock() - started
-        self._record_success(slot, duration)
-        logger.info("[OCR] request=%s %s succeeded purpose=%s provider_time=%.2fs", rid, slot.label, purpose,
-                    duration)
-        return result
+            return slot
 
     def _record_success(self, slot: _Slot, seconds: float) -> None:
         with self._lock:
@@ -631,33 +444,39 @@ class GeminiKeyManager:
                 f"Gemini recently failed with a shared error ({self._shared_block_category}); skipping",
                 self._shared_block_category, 0)
 
-        order, skipped = self._plan()
-        logger.info("[OCR] request=%s purpose=%s available_keys=%d/%d selection=%s order=%s", rid, purpose,
-                    len(order), len(self._slots), p.selection, ",".join(s.label for s in order) or "-")
-        attempts = shared_fails = invalid_fails = model_404s = 0
+        healthy = self.counts()["available"]
+        logger.info("[OCR] request=%s purpose=%s available_keys=%d/%d selection=%s", rid,
+                    purpose, healthy, len(self._slots), p.selection)
+        attempts = shared_fails = invalid_fails = model_404s = timeouts = 0
         last_shared: tuple[str, BaseException] | None = None
         last_404: BaseException | None = None
         last_invalid: InvalidResponse | None = None
+        last_timeout: BaseException | None = None
         failed_at: float | None = None
+        tried: set[int] = set()
+        # processing timeouts tolerated per call: same bound as other shared failures, never a breaker trip
+        max_timeouts = max(1, p.shared_failover_max_keys)
 
-        for slot in order:
-            now = self._clock()
-            if not slot.available(now):  # another request penalized it after the plan was made
-                skipped += 1
-                continue
-            remaining = deadline - now
-            if remaining <= 0:
-                raise GeminiSharedFailure("Gemini time budget exhausted", "budget_exceeded", attempts)
+        while True:
             if attempts and p.failover_delay_seconds > 0:
-                await asyncio.sleep(min(p.failover_delay_seconds, max(remaining - 0.001, 0)))
-            switch_ms = (self._clock() - failed_at) * 1000 if failed_at is not None else 0.0
-            timeout = min(p.request_timeout_seconds, deadline - self._clock())
-            if timeout < min(_MIN_ATTEMPT_SECONDS, p.request_timeout_seconds):
-                # too little budget left for a call to finish: do not waste quota on a doomed request
+                await asyncio.sleep(min(p.failover_delay_seconds, max(deadline - self._clock() - 0.001, 0)))
+            remaining = deadline - self._clock()
+            timeout = min(p.request_timeout_seconds, remaining)
+            if timeout < min(max(p.min_attempt_seconds, _MIN_ATTEMPT_SECONDS), p.request_timeout_seconds):
+                # too little budget left for a call to finish: do not waste quota on a doomed request and
+                # never blame the provider for the application's own deadline
+                logger.warning("[OCR] request=%s purpose=%s remaining budget %.1fs is too small for another "
+                               "attempt: not starting one (key health unchanged)", rid, purpose, remaining)
                 raise GeminiSharedFailure("Gemini time budget exhausted", "budget_exceeded", attempts)
+            slot = self._next_slot(tried)
+            if slot is None:
+                break  # no eligible key left
+            now = self._clock()
+            budget_limited = timeout < p.request_timeout_seconds
+            tried.add(slot.number)
             attempts += 1
-            attempt_started = self._clock()
-            self._begin(slot)
+            attempt_started = now
+            switch_ms = (now - failed_at) * 1000 if failed_at is not None else 0.0
             if attempts > 1:
                 logger.info("[OCR] request=%s switching to %s (failover selection %.2fms)", rid, slot.label, switch_ms)
             try:
@@ -665,7 +484,7 @@ class GeminiKeyManager:
                 if validate is not None:
                     validate(result)
             except asyncio.CancelledError:
-                raise  # caller gave up: do not blame the key (active count is released below)
+                raise  # caller gave up: do not blame the key
             except InvalidResponse as exc:
                 failed_at = self._clock()
                 self._record_failure(slot, exc.category)
@@ -676,6 +495,24 @@ class GeminiKeyManager:
                 if not p.failover_enabled or invalid_fails >= p.max_invalid_response_attempts:
                     raise GeminiInvalidResponse(f"Gemini returned an unusable response: {exc.category}",
                                                 exc.category, attempts) from exc
+                continue
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                failed_at = self._clock()
+                if budget_limited:
+                    # the application gave this attempt less than a full timeout: nobody's fault, no health or
+                    # circuit-breaker consequence
+                    logger.warning("[OCR] request=%s attempt=%d %s hit the application deadline after %.1fs "
+                                   "(budget-limited; key health unchanged, no circuit breaker)", rid, attempts,
+                                   slot.label, failed_at - attempt_started)
+                    raise GeminiSharedFailure("Gemini time budget exhausted", "budget_exceeded", attempts) from exc
+                timeouts += 1
+                last_timeout = exc
+                self._record_failure(slot, "timeout")  # counter only: a slow response never disables or benches a key
+                logger.warning("[OCR] request=%s attempt=%d %s processing timeout after %.1fs (key health "
+                               "unchanged, circuit breaker not used)", rid, attempts, slot.label,
+                               failed_at - attempt_started)
+                if not p.failover_enabled or timeouts >= max_timeouts:
+                    raise GeminiSharedFailure("Gemini processing timeout", "timeout", attempts) from exc
                 continue
             except Exception as exc:
                 failed_at = self._clock()
@@ -689,6 +526,13 @@ class GeminiKeyManager:
                         raise GeminiKeysExhausted("Gemini failover is disabled", failure.category, attempts) from exc
                     continue  # next key immediately, no sleep
                 detail = self.redact(" ".join(str(exc).split())[:160])
+                if failure.kind == Kind.SHARED and failure.category == "timeout":
+                    # provider-side 408/504: slow work, not a provider outage
+                    timeouts += 1
+                    last_timeout = exc
+                    if not p.failover_enabled or timeouts >= max_timeouts:
+                        raise GeminiSharedFailure("Gemini processing timeout", "timeout", attempts) from exc
+                    continue
                 if failure.kind == Kind.SHARED:
                     shared_fails += 1
                     last_shared = (failure.category, exc)
@@ -713,8 +557,6 @@ class GeminiKeyManager:
                              slot.number, failure.category, detail)
                 raise GeminiRequestFailure(f"Gemini rejected the request: {failure.category}",
                                            failure.category, attempts) from exc
-            finally:
-                self._end(slot)
             duration = self._clock() - attempt_started
             self._record_success(slot, duration)
             logger.info("Gemini credential slot %d: request succeeded (purpose=%s attempts=%d duration=%.2fs)",
@@ -723,12 +565,13 @@ class GeminiKeyManager:
                         duration)
             return result
 
-        logger.error("Gemini: no credential could serve the request (purpose=%s attempts=%d skipped=%d)",
-                     purpose, attempts, skipped)
+        logger.error("Gemini: no credential could serve the request (purpose=%s attempts=%d)", purpose, attempts)
         if last_shared is not None:
             self._open_breaker(last_shared[0])
             raise GeminiSharedFailure(f"Gemini shared failure: {last_shared[0]}", last_shared[0],
                                       attempts) from last_shared[1]
+        if last_timeout is not None:
+            raise GeminiSharedFailure("Gemini processing timeout", "timeout", attempts) from last_timeout
         if last_404 is not None:
             raise GeminiRequestFailure("Gemini rejected the request: model_not_found", "model_not_found",
                                        attempts) from last_404
@@ -737,26 +580,6 @@ class GeminiKeyManager:
                                         last_invalid.category, attempts) from last_invalid
         raise GeminiKeysExhausted("All Gemini credentials failed or are unavailable",
                                   "all_keys_unavailable", attempts)
-
-    async def check_keys(self, model: str) -> list[dict[str, Any]]:
-        """Probe every key once with a metadata-only call (no document content is sent). A key that was
-        disabled for authentication and now answers is re-enabled (credential replaced / fixed)."""
-        results = []
-        for slot in self._slots:
-            try:
-                await asyncio.wait_for(self._client(slot).aio.models.get(model=model),
-                                       self.policy.request_timeout_seconds)
-                with self._lock:
-                    if slot.disabled_reason == "authentication_failed":
-                        slot.disabled_reason = None
-                results.append({"slot": slot.number, "status": "ok"})
-            except Exception as exc:
-                failure = classify_error(exc)
-                if failure.kind in _KEY_KINDS:
-                    self._penalize(slot, failure)
-                results.append({"slot": slot.number, "status": failure.category})
-        return results
-
 
 def _default_client_factory(api_key: str, policy: Policy) -> Any:
     from google import genai
@@ -794,14 +617,3 @@ def set_manager(manager: GeminiKeyManager | None) -> None:
     global _manager
     with _manager_lock:
         _manager = manager
-
-
-def reload_manager() -> GeminiKeyManager:
-    """Re-read settings/.env and apply them to the live manager (add/remove keys without a restart).
-    Existing keys keep their health state."""
-    get_settings.cache_clear()
-    settings = get_settings()
-    manager = get_manager()
-    manager.reload(load_keys(settings), Policy.from_settings(settings))
-    logger.info("Gemini key manager reloaded: %d credential slot(s)", len(manager._slots))
-    return manager

@@ -25,8 +25,13 @@ class Settings(BaseSettings):
     gemini_api_key_8: str = ""
     gemini_api_key_9: str = ""
     gemini_api_key_10: str = ""
-    gemini_request_timeout_seconds: float = Field(default=90.0, gt=0)  # per attempt
-    gemini_overall_budget_seconds: float = Field(default=110.0, gt=0)  # whole failover chain
+    # Per attempt. The whole document is one request, so long/scanned PDFs need a generous value.
+    gemini_request_timeout_seconds: float = Field(default=150.0, gt=0)
+    # Whole failover chain of one call. Keep it >= 2 x request timeout + margin so a first slow key cannot
+    # leave the second key a doomed sliver of time.
+    gemini_overall_budget_seconds: float = Field(default=310.0, gt=0)
+    # An attempt is not started with less budget than this left (it could not finish): no doomed call, no blame.
+    gemini_min_attempt_seconds: float = Field(default=15.0, ge=0)
     gemini_shared_failure_cooldown_seconds: float = Field(default=10.0, ge=0)  # fast-fail after network/5xx
     gemini_rate_limit_cooldown_seconds: float = Field(default=60.0, ge=0)  # 429 without Retry-After
     gemini_quota_cooldown_seconds: float = Field(default=3600.0, ge=0)  # daily quota exhausted
@@ -44,29 +49,9 @@ class Settings(BaseSettings):
     gemini_shared_failover_max_keys: int = Field(default=2, ge=1)
     # Keys tried for one request whose response is empty/truncated/invalid before giving up on Gemini.
     gemini_max_invalid_response_attempts: int = Field(default=2, ge=1)
-    # Per-key concurrency. Batch OCR enforces it STRICTLY (a key at its cap is never handed out); the legacy
-    # whole-document path only uses it as a soft preference. 0 = unlimited.
-    gemini_max_concurrent_per_key: int = Field(default=1, ge=0)
     ocr_validate_response: bool = True  # reject empty/truncated/invalid Gemini output (retry other key)
     ocr_retry_failed_pages: bool = True  # re-OCR only missing pages / page-by-page after truncation
-    ocr_overall_deadline_seconds: float = Field(default=240.0, gt=0)  # Gemini + Groq together
-
-    # --- Parallel batch OCR (see services/ocr/batch_ocr.py) ---
-    # A PDF with more pages than one batch is split into page batches OCRed concurrently on different keys.
-    ocr_batch_processing_enabled: bool = True  # False: whole document in one request (legacy path)
-    ocr_batch_size: int = Field(default=5, ge=1)  # pages per batch (documents up to this size are one batch)
-    ocr_batch_min_size: int = Field(default=1, ge=1)  # failed batches are never split below this many pages
-    ocr_heavy_page_bytes: int = Field(default=1_500_000, ge=1)  # avg bytes/page above this = scanned/dense
-    ocr_max_parallel_batches: int = Field(default=4, ge=1)  # simultaneous batches of ONE document (upper bound)
-    ocr_global_max_concurrent_batches: int = Field(default=4, ge=0)  # process-wide Gemini batch calls, 0 = unlimited
-    gemini_reserved_keys: int = Field(default=2, ge=0)  # standby keys kept free for failed-batch recovery
-    ocr_adaptive_timeout_enabled: bool = True  # False: ocr_batch_timeout_seconds for every batch
-    ocr_batch_timeout_seconds: float = Field(default=90.0, gt=0)  # timeout of a full-size (ocr_batch_size) batch
-    ocr_batch_timeout_max_seconds: float = Field(default=180.0, gt=0)  # upper bound of an adaptive timeout
-    ocr_auto_split_failed_batches: bool = True  # halve a batch that timed out / was truncated / was rejected
-    ocr_metadata_after_merge: bool = True  # multi-batch docs: extract metadata from the merged text in the request
-    ocr_metadata_reserve_seconds: float = Field(default=40.0, ge=0)  # deadline share kept for metadata
-    ocr_groq_max_concurrent: int = Field(default=2, ge=1)  # simultaneous Groq batch fallbacks (process-wide)
+    ocr_overall_deadline_seconds: float = Field(default=400.0, gt=0)  # OCR: Gemini + Groq together
 
     groq_api_key: str = ""
     groq_model: str = "qwen/qwen3.8-27b"
@@ -76,11 +61,9 @@ class Settings(BaseSettings):
     # --- OCR: Gemini (ordered key failover) -> Groq, whole document ---
     ocr_enable_gemini_fallback: bool = True  # False skips Gemini entirely
     ocr_enable_groq_fallback: bool = True
-    ocr_gemini_max_retries: int = Field(default=1, ge=0, le=3)  # Gemini failover already bounds retries
     ocr_groq_max_retries: int = Field(default=1, ge=0, le=3)
-    ocr_remote_timeout_seconds: float = Field(default=120.0, gt=0)
 
-    # Per-provider cap for one background metadata attempt (Gemini and Groq each).
+    # Per-provider cap for a text-only metadata attempt (used when the OCR response carried no metadata).
     metadata_timeout_seconds: float = 90.0
 
     model_config = SettingsConfigDict(

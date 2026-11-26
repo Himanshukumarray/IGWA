@@ -1,5 +1,4 @@
 import asyncio
-import contextvars
 import json
 import logging
 import re
@@ -90,11 +89,6 @@ def parse_gemini_json(text: str | None) -> dict[str, Any]:
         raise GeminiOCRError("Gemini response had unexpected structure")
     return parsed
 
-# Page count of the document being OCRed, set once by the service (single source of truth). Unset:
-# extract_text counts the pages itself. None: unknown, page checks are skipped.
-_UNSET: Any = object()
-expected_pages_var: contextvars.ContextVar[Any] = contextvars.ContextVar("ocr_expected_pages", default=_UNSET)
-
 _OK_FINISH = {"", "NONE", "STOP", "FINISH_REASON_UNSPECIFIED"}
 _PAGEWISE_CATEGORIES = {"truncated", "invalid_json", "schema_validation"}
 _PAGEWISE_CONCURRENCY = 3
@@ -165,33 +159,6 @@ def _make_validator(expected: int | None, allow_missing: bool, box: dict[str, An
     return validate
 
 
-def make_batch_validator(expected: int, allow_missing: bool, box: dict[str, Any]):
-    """Response check for one OCR batch (local page numbers 1..expected). Same rules as the
-    whole-document validator; a response that only MISSES pages passes when allow_missing."""
-    return _make_validator(expected, allow_missing, box)
-
-
-def build_batch_call(data: bytes, timeout: float):
-    """`call(client)` for one PDF batch: plain OCR prompt (no metadata: that runs once after the merge).
-    The per-request SDK timeout is a little above the scheduler's own timeout, so the scheduler's
-    asyncio timeout is always the one that fires (classified as a processing timeout)."""
-    settings = get_settings()
-
-    def call(client):
-        return client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=[types.Part.from_bytes(data=data, mime_type="application/pdf"), OCR_PROMPT],
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-                response_schema=GeminiOCRResult,
-                http_options=types.HttpOptions(timeout=int((timeout + 5.0) * 1000)),
-            ),
-        )
-
-    return call
-
-
 async def _run_once(data: bytes, mime_type: str, prompt: str, expected: int | None, allow_missing: bool,
                     deadline: float, purpose: str = "ocr") -> dict[str, Any]:
     """One manager-driven OCR call (own key failover) -> validated parsed dict."""
@@ -260,9 +227,7 @@ async def extract_text(data: bytes, mime_type: str) -> dict[str, Any]:
     Shared outages and malformed requests stop immediately instead of rotating through every key.
     """
     settings = get_settings()
-    expected = expected_pages_var.get()
-    if expected is _UNSET:
-        expected = count_pages(data, mime_type)
+    expected = count_pages(data, mime_type)
     deadline = time.monotonic() + key_manager.get_manager().policy.overall_budget_seconds
     pagewise_ok = bool(settings.ocr_retry_failed_pages and settings.ocr_validate_response and expected
                        and expected > 1 and mime_type == "application/pdf")

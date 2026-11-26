@@ -124,14 +124,15 @@ def test_ordered_mode_keeps_configured_order():
     assert f.calls == [1, 2]
 
 
-def test_failover_walks_a_shuffled_order_and_never_repeats_a_key():
+def test_failover_walks_a_random_order_and_never_repeats_a_key():
+    # Guarantees: never repeat a key in one request, stop at the first success, random order (not 1..6).
+    orders = set()
     for seed in range(40):
         f = Fleet({i: [ApiError(429, "slow")] for i in (1, 2, 3, 4, 5)}, seed=seed)  # only key 6 works
         execute(f)
         assert f.calls[-1] == 6 and len(f.calls) == len(set(f.calls)) and len(f.calls) <= 6
-        expected = list(range(1, 7))
-        random.Random(seed).shuffle(expected)
-        assert f.calls == expected[: expected.index(6) + 1]  # exactly the planned shuffle, in order
+        orders.add(tuple(f.calls))
+    assert len(orders) > 5
 
 
 def test_first_fails_second_succeeds_and_nothing_else_is_called():
@@ -159,7 +160,13 @@ def test_429_cools_down_and_other_keys_serve_until_recovery():
     assert f.calls == [1] and health(f)[1] == "HEALTHY"
 
 
-@pytest.mark.parametrize("code", [500, 502, 503, 504])
+def test_504_is_a_processing_timeout_rotates_without_benching_the_key():
+    f = Fleet({1: [ApiError(504, "deadline")]}, policy=km.Policy(selection="ordered", shared_failover_max_keys=2))
+    execute(f)
+    assert f.calls == [1, 2] and health(f)[1] == "HEALTHY"  # slow work is not a key failure
+
+
+@pytest.mark.parametrize("code", [500, 502, 503])
 def test_5xx_rotates_to_another_key_and_benches_the_failing_one(code):
     f = Fleet({1: [ApiError(code, "overloaded")]}, policy=km.Policy(selection="ordered", shared_failover_max_keys=2))
     execute(f)
@@ -183,15 +190,6 @@ def test_invalid_or_unauthenticated_key_is_disabled_and_skipped(code, message):
     execute(f)
     execute(f)
     assert f.calls == [1, 2, 2] and health(f)[1] == "AUTHENTICATION_FAILED"
-
-
-def test_authentication_failure_recovers_after_credential_check_succeeds():
-    f = Fleet({1: [ApiError(401, "nope")]}, policy=km.Policy(selection="ordered"))
-    execute(f)
-    f.manager._slots[0].client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(
-        get=lambda model: asyncio.sleep(0))))
-    run(f.manager.check_keys("m"))
-    assert health(f)[1] == "HEALTHY"
 
 
 # ---- 9-11: request errors ----------------------------------------------------------------------------
@@ -248,7 +246,6 @@ def ocr(fleet, monkeypatch, pages=1, **settings):
     for i in range(pages):
         doc.new_page().insert_text((72, 100), f"page {i + 1}", fontsize=11)
     data = doc.tobytes()
-    gemini_client.expected_pages_var.set(pages)
     return run(gemini_client.extract_text(data, "application/pdf"))
 
 
@@ -326,7 +323,7 @@ class Env:
         monkeypatch.setattr(gemini_client, "get_settings", lambda: cfg)
         service.ocr_results.clear()
 
-        async def groq(data, mime):
+        async def groq(data, mime, done=None):
             self.groq_calls += 1
             if not groq_ok:
                 raise GroqOCRError("down")
@@ -407,13 +404,6 @@ def test_duplicate_and_empty_keys_are_dropped_and_pool_size_is_dynamic():
     assert km.load_keys(s) == KEYS  # six unique keys, nothing hard-coded to five
 
 
-def test_reload_adds_and_removes_keys_and_keeps_health_of_survivors():
-    f = Fleet({1: [ApiError(401, "bad")]}, keys=KEYS[:3], policy=km.Policy(selection="ordered"))
-    execute(f)
-    f.manager.reload([KEYS[0], KEYS[2], KEYS[4], KEYS[5]])
-    assert f.manager.counts() == {"configured": 4, "available": 3}  # KEYS[0] stays disabled
-
-
 # ---- 23, 25: latency -----------------------------------------------------------------------------------------
 
 
@@ -449,7 +439,7 @@ def test_failover_disabled_uses_a_single_key():
 def test_concurrent_uploads_all_succeed_with_balanced_load_and_clean_state(monkeypatch):
     Env(monkeypatch)
     f = Fleet({1: [ApiError(429, "slow", {"retry-after": "60"})]}, seed=9,
-              policy=km.Policy(selection="random", max_concurrent_per_key=4)).install(monkeypatch)
+              policy=km.Policy(selection="random")).install(monkeypatch)
 
     async def burst():
         return await asyncio.gather(*(service.process_ocr(FakeFile()) for _ in range(60)))
@@ -458,38 +448,25 @@ def test_concurrent_uploads_all_succeed_with_balanced_load_and_clean_state(monke
     assert len(results) == 60 and len({r.document_id for r in results}) == 60  # no shared/leaked records
     assert all(r.ocr_provider == "gemini" for r in results)
     snap = f.manager.snapshot()
-    assert all(s["active_requests"] == 0 for s in snap)
     assert f.manager.snapshot()[0]["health"] == "RATE_LIMITED"  # cooled down for every later request
     assert f.calls.count(1) <= 60 // 6 * 2  # only requests already in flight before the 429 touched it
     assert sum(s["successful_requests"] for s in snap) == 60
 
 
-def test_saturated_keys_are_deprioritized_not_blocked():
-    f = Fleet(policy=km.Policy(selection="random", max_concurrent_per_key=1), seed=1)
-    for s in f.manager._slots[:5]:
-        s.active = 1  # five keys busy
-    order, _ = f.manager._plan()
-    assert order[0].number == 6
-    for s in f.manager._slots:
-        s.active = 1  # all busy: still usable
-    assert len(f.manager._plan()[0]) == 6
-
-
-def test_cancelled_request_releases_the_key_and_does_not_blame_it():
+def test_cancelled_request_does_not_blame_the_key():
     f = Fleet({i: ["hang"] for i in range(1, 7)}, policy=km.Policy(selection="ordered", request_timeout_seconds=30))
 
     async def scenario():
         task = asyncio.create_task(f.manager.execute(
             lambda c: c.aio.models.generate_content(model="m", contents=["x"]), purpose="t"))
         await asyncio.sleep(0.05)
-        assert f.manager.snapshot()[0]["active_requests"] == 1
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
     run(scenario())
     s = f.manager.snapshot()[0]
-    assert s["active_requests"] == 0 and s["health"] == "HEALTHY" and s["failed_requests"] == 0
+    assert s["health"] == "HEALTHY" and s["failed_requests"] == 0
 
 
 # ---- health bookkeeping ----------------------------------------------------------------------------------------------
@@ -549,7 +526,7 @@ def test_structured_log_traces_selection_failover_and_success(monkeypatch, caplo
     with caplog.at_level(logging.INFO):
         execute(f)
     text = caplog.text
-    assert "request=req-123" in text and "available_keys=6/6" in text and "order=Key-1,Key-2" in text
+    assert "request=req-123" in text and "available_keys=6/6" in text
     assert "Key-1 failed: rate_limited" in text and "switching to Key-2" in text and "failover selection" in text
     assert "Key-2 succeeded" in text
 

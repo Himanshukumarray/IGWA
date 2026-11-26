@@ -34,7 +34,6 @@ def env(monkeypatch):
 
     monkeypatch.setattr(service.utils, "read_upload_limited", read)
     monkeypatch.setattr(service.utils, "validate_content_matches_extension", lambda d, e: "application/pdf")
-    monkeypatch.setattr(service.utils, "preprocess_document", lambda d, m: (d, m))
     service.ocr_results.clear()
 
     def setup(ocr=RAW, g_meta=M, q_meta=M, g_ocr_fails=False, q_ocr_fails=False):
@@ -43,7 +42,7 @@ def env(monkeypatch):
                 raise GeminiOCRError("x")
             return ocr
 
-        async def qo(d, m):
+        async def qo(d, m, done=None):
             if q_ocr_fails:
                 raise GroqOCRError("x")
             return ocr

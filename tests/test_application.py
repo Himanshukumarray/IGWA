@@ -199,13 +199,13 @@ def env(monkeypatch):
     cfg = get_settings().model_copy(update=dict(gemini_model="gem", groq_model="grq"))
     monkeypatch.setattr(service, "get_settings", lambda: cfg)
     service.ocr_results.clear()
-    monkeypatch.setattr(service, "_expected_page_count", lambda payload, mime: None)
+    monkeypatch.setattr(gemini_client, "count_pages", lambda payload, mime: None)
 
     def install(combined=None, text_only=None, groq_pages=None, groq_meta=None):
         g = Gemini(combined, text_only)
         monkeypatch.setattr(km, "_manager", km.GeminiKeyManager([KEY], client_factory=lambda k, p: g.client))
 
-        async def groq_ocr(data, mime):
+        async def groq_ocr(data, mime, done=None):
             return {"pages": groq_pages or PAGES5, "full_text": ""}
 
         monkeypatch.setattr(groq_client, "extract_text", groq_ocr)

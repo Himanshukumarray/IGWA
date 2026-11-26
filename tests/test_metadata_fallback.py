@@ -32,7 +32,6 @@ def env(monkeypatch):
     async def read(f, m): return b"x"
     monkeypatch.setattr(service.utils, "read_upload_limited", read)
     monkeypatch.setattr(service.utils, "validate_content_matches_extension", lambda d, e: "application/pdf")
-    monkeypatch.setattr(service.utils, "preprocess_document", lambda d, m: (d, m))
     service.ocr_results.clear()
 
     def setup(g_ocr=RAW, q_ocr=RAW, g_meta=None, q_meta=None):
@@ -40,7 +39,7 @@ def env(monkeypatch):
             calls["g_ocr"] += 1
             if g_ocr is None: raise GeminiOCRError("x")
             return g_ocr
-        async def qo(d, m):
+        async def qo(d, m, done=None):
             calls["q_ocr"] += 1
             if q_ocr is None: raise GroqOCRError("x")
             return q_ocr

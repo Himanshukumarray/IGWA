@@ -324,7 +324,7 @@ class PipelineEnv:
     def __init__(self, monkeypatch, **overrides):
         self.groq_calls = 0
 
-        async def groq(data, mime):
+        async def groq(data, mime, done=None):
             self.groq_calls += 1
             return {"pages": [{"page_number": 1, "text": "GROQ PAGE TEXT FIR 123/2026 Sadar"}],
                     "full_text": "GROQ PAGE TEXT FIR 123/2026 Sadar"}
@@ -359,7 +359,6 @@ def test_all_gemini_keys_fail_then_groq_is_used_and_counted(pipe, monkeypatch):
     r = run(service.process_ocr(FakeFile(scan_pdf())))
     assert f.calls == [1, 2, 3, 4, 5]  # exactly one attempt per key: no retry multiplication
     assert pipe.groq_calls == 1 and r.ocr_provider == "groq" and r.ocr_model == "grq"
-    assert f.manager.metrics["groq_fallbacks"] == 1
 
 
 def test_shared_gemini_outage_goes_straight_to_groq_with_one_request(pipe, monkeypatch):
@@ -378,7 +377,7 @@ def test_both_providers_failing_is_a_controlled_502(pipe, monkeypatch):
     from fastapi import HTTPException
     from services.ocr.groq_client import GroqOCRError
 
-    async def groq_down(data, mime):
+    async def groq_down(data, mime, done=None):
         raise GroqOCRError("down")
 
     monkeypatch.setattr(groq_client, "extract_text", groq_down)
@@ -456,7 +455,6 @@ def test_metadata_background_falls_back_to_groq_when_every_gemini_key_fails(monk
     out = service.get_metadata_status("j1")
     assert out.metadata_status == MetadataStatus.COMPLETED and out.metadata.fir_number == "FROM-GROQ"
     assert out.metadata_provider == "grq" and f.calls == [1, 2, 3, 4, 5]
-    assert f.manager.metrics["groq_fallbacks"] == 1
 
 
 def test_metadata_request_error_does_not_rotate_keys(monkeypatch):

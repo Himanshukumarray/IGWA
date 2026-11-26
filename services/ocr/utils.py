@@ -75,11 +75,3 @@ def validate_content_matches_extension(data: bytes, ext: str) -> str:
     if detect_type_from_content(data) != expected:
         raise HTTPException(status_code=400, detail="Unsupported file type")
     return CANONICAL_MIME[ext]
-
-
-def preprocess_document(data: bytes, mime_type: str) -> tuple[bytes, str]:
-    """Hook for future preprocessing (e.g. PDF splitting, image deskew).
-
-    Currently the document is sent to Gemini unchanged.
-    """
-    return data, mime_type

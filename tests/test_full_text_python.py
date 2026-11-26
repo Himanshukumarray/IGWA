@@ -55,7 +55,7 @@ def env(monkeypatch):
     service.ocr_results.clear()
     groq = {"calls": 0, "pages": None}
 
-    async def groq_stub(data, mime):
+    async def groq_stub(data, mime, done=None):
         groq["calls"] += 1
         n = fitz.open(stream=data, filetype="pdf").page_count
         texts = [f"GROQ PAGE {i + 1}" for i in range(n)]
@@ -168,8 +168,8 @@ def test_groq_full_text_matches_the_python_join(env):
 def test_uncountable_input_skips_the_guard_like_before(env, monkeypatch):
     # A corrupt PDF cannot be counted; behaviour is unchanged from before (provider output is used).
     env({"pages": [{"page_number": 1, "text": "only"}], "metadata": META})
-    assert service._expected_page_count(b"%PDF-1.4 broken", "application/pdf") is None
-    assert service._expected_page_count(b"\x89PNG", "image/png") == 1
+    assert gemini_client.count_pages(b"%PDF-1.4 broken", "application/pdf") is None
+    assert gemini_client.count_pages(b"\x89PNG", "image/png") == 1
 
 
 # ---- logging ---------------------------------------------------------------------------------------------------------
